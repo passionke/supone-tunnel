@@ -1,0 +1,46 @@
+[package]
+name = "supone-tunnel"
+version = "0.1.0"
+edition = "2021"
+description = "轻量 mihomo 壳"
+authors = ["kejiqing"]
+default-run = "supone-tunnel"
+
+[lib]
+name = "supone_tunnel"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "supone-priv"
+path = "src/bin/supone-priv.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+aho-corasick = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+flate2 = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+ipnet = "2"
+maxminddb = "0.24"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+urlencoding = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[dev-dependencies]
+tempfile = "3.27.0"
