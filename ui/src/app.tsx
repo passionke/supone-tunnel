@@ -257,12 +257,10 @@ function ProfilePane() {
       </form>
       {profiles.length === 0 && <p className="muted">还没有订阅。</p>}
       {profiles.map((profile) => (
-        <div className="profile" key={profile.id}>
+        <div className={profile.active ? "profile profile--active" : "profile"} key={profile.id}>
           <div>
-            <strong>
-              {profile.name}
-              {profile.active ? " · 当前" : ""}
-            </strong>
+            <strong>{profile.name}</strong>
+            {profile.active ? <span className="profile-badge">当前</span> : null}
             <div className="url">{profile.url}</div>
             <div className="muted">{profile.updatedAt}</div>
           </div>

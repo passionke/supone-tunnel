@@ -165,6 +165,31 @@ textarea.yaml {
   border-top: 1px solid #eef1f6;
 }
 
+.profile--active {
+  margin-top: 8px;
+  padding: 12px;
+  border-top: none;
+  border-radius: 10px;
+  background: #eef5ff;
+  border-left: 3px solid #1f6feb;
+}
+
+.profile--active strong {
+  color: #1f6feb;
+}
+
+.profile-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: #1f6feb;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 500;
+  vertical-align: middle;
+}
+
 .profile .url {
   word-break: break-all;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
-use chrono::SecondsFormat;
+use chrono::{FixedOffset, SecondsFormat};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use uuid::Uuid;
@@ -1071,7 +1071,11 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn now_stamp() -> String {
-    chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    // 统一东八区展示，避免 UI 出现带 Z 的 UTC。Author: kejiqing
+    let cst = FixedOffset::east_opt(8 * 3600).expect("+08:00");
+    chrono::Utc::now()
+        .with_timezone(&cst)
+        .to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 fn clean_name(name: &str) -> String {
