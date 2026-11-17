@@ -359,15 +359,25 @@ function OverridePane() {
 function ChatPane() {
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  // 本地 activeId：下拉是受控组件，必须立刻跟上用户选择，否则会弹回旧项看起来「没生效」。Author: kejiqing
+  const [activeId, setActiveId] = useState("");
   const [text, setText] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [sending, setSending] = useState(false);
   const thread = useRef<HTMLDivElement>(null);
 
+  function applyConversations(list: ConversationSummary[]) {
+    setConversations(list);
+    const active = list.find((item) => item.active);
+    if (active) {
+      setActiveId(active.id);
+    }
+  }
+
   async function refreshConversations() {
     try {
-      setConversations(await agentListConversations());
+      applyConversations(await agentListConversations());
     } catch (err) {
       setError(message(err));
     }
@@ -377,7 +387,7 @@ function ChatPane() {
     Promise.all([agentHistory(), agentListConversations()])
       .then(([history, list]) => {
         setMessages(history);
-        setConversations(list);
+        applyConversations(list);
       })
       .catch((err) => setError(message(err)));
   }, []);
@@ -387,10 +397,8 @@ function ChatPane() {
     if (node) {
       node.scrollTop = node.scrollHeight;
     }
-  }, [messages, sending]);
+  }, [messages, sending, activeId]);
 
-  const active = conversations.find((item) => item.active);
-  const activeId = active?.id ?? "";
   const locked = busy || sending;
 
   function send() {
@@ -443,9 +451,11 @@ function ChatPane() {
     setError("");
     agentNewConversation()
       .then(async (next) => {
+        // 先拉列表再清消息，避免「消息已空、下拉仍显示旧会话」的闪一下。Author: kejiqing
+        const list = await agentListConversations();
+        applyConversations(list);
         setMessages(next);
         setText("");
-        await refreshConversations();
       })
       .catch((err) => setError(message(err)))
       .finally(() => setBusy(false));
@@ -455,15 +465,28 @@ function ChatPane() {
     if (locked || !id || id === activeId) {
       return;
     }
+    const previousId = activeId;
+    const previousMessages = messages;
     setBusy(true);
     setError("");
+    setActiveId(id);
+    setMessages([]);
+    setText("");
     agentOpenConversation(id)
       .then(async (next) => {
         setMessages(next);
-        setText("");
         await refreshConversations();
       })
-      .catch((err) => setError(message(err)))
+      .catch(async (err) => {
+        setActiveId(previousId);
+        setMessages(previousMessages);
+        setError(message(err));
+        try {
+          await refreshConversations();
+        } catch {
+          // 恢复列表失败时至少把下拉与消息弹回原会话。
+        }
+      })
       .finally(() => setBusy(false));
   }
 
@@ -493,12 +516,12 @@ function ChatPane() {
           新对话
         </button>
       </div>
-      <div className="chat" ref={thread}>
+      <div className="chat" ref={thread} key={activeId}>
         {messages.length === 0 && !sending && (
           <p className="chat-empty">直接说要改的出口、规则或 DNS。设置里可配 DeepSeek SK 或 NeuroGate。</p>
         )}
         {messages.map((item, index) => (
-          <ChatMessage item={item} key={`${item.role}-${index}`} />
+          <ChatMessage item={item} key={`${activeId}-${item.role}-${index}`} />
         ))}
         {sending && (
           <div className="chat-thinking">
