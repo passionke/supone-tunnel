@@ -102,8 +102,8 @@ pub async fn exchange_call_token(subscription_token: &str) -> Result<CallTokenRe
     }
     let parsed: CallTokenResponse = serde_json::from_str(&raw)
         .map_err(|err| format!("换取调用 token 响应无效: {err}"))?;
-    if !parsed.call_token.starts_with("ngmk_") {
-        return Err("换取调用 token 响应无效: 非 ngmk_ 钥".into());
+    if !(parsed.call_token.starts_with("phllm_") || parsed.call_token.starts_with("ngmk_")) {
+        return Err("换取调用 token 响应无效: 非 phllm_/ngmk_ 钥".into());
     }
     if parsed.base_url.trim().is_empty() {
         return Err("换取调用 token 响应无效: 缺少 base_url".into());

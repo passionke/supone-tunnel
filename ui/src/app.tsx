@@ -519,7 +519,7 @@ function ChatPane() {
       <div className="chat" ref={thread} key={activeId}>
         {messages.length === 0 && !sending && (
           <p className="chat-empty">
-            壳内对话是 NeuroGate 聊天脑（不改本机配置）。改出口/规则请用本机 PI + MCP。需先在「订阅」导入
+            壳内对话走本机工具环（Hub phllm_ → llm.bitkindle.com）。需先在「订阅」导入
             https://phub.supone.vip/clash/…
           </p>
         )}
@@ -681,14 +681,14 @@ function SettingsPane() {
   return (
     <section className="panel">
       <p className="muted">
-        壳内对话走 NeuroGate 聊天脑（不挂本机工具）。改 mihomo 用本机 PI + MCP。对话凭证由订阅换取，并带 Hub user_id 归因。
+        壳内对话走本机工具环：订阅换 phllm_ → supone-llm（DeepSeek）→ 本地改节点/规则。
       </p>
       <div className="grid settings-grid">
         <label htmlFor="agent-model">对话模型</label>
         <input
           id="agent-model"
           type="text"
-          placeholder="agent"
+          placeholder="deepseek-chat"
           value={form.agentModel}
           onInput={(event) => setForm({ ...form, agentModel: event.currentTarget.value })}
         />

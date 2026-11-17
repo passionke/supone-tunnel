@@ -47,6 +47,16 @@ pub struct RedactSources {
     pub yaml_bodies: Vec<String>,
 }
 
+/// 旧默认 `agent` 是 NeuroGate 项目名；工具环上游写死 DeepSeek。Author: kejiqing
+fn normalize_agent_model(model: &str) -> String {
+    let model = model.trim();
+    if model.is_empty() || model == "agent" {
+        "deepseek-chat".into()
+    } else {
+        model.to_string()
+    }
+}
+
 pub struct Shell {
     profiles: ProfileStore,
     pub(crate) settings: SettingsStore,
@@ -121,7 +131,7 @@ impl Shell {
         Ok(self.settings_view())
     }
 
-    /// 用当前订阅 token 换取 / 复用 NeuroGate 调用钥。Author: kejiqing
+    /// 用当前订阅 token 换取 / 复用 Hub phllm_（supone-llm）。Author: kejiqing
     pub async fn agent_settings(&self) -> Result<crate::agent::AgentSettings, String> {
         let url = self
             .profiles
@@ -129,8 +139,11 @@ impl Shell {
             .ok_or_else(crate::call_token::missing_subscription_hint)?;
         let sub_token = crate::call_token::parse_subscription_token(&url)?;
         let data = self.settings.get();
+        // 只复用 phllm_（supone-llm）；旧 ngmk_ 强制重签。Author: kejiqing
+        let key_ok = data.agent_api_key.starts_with("phllm_");
+        let model = normalize_agent_model(&data.agent_model);
         if data.agent_subscription_token == sub_token
-            && data.agent_api_key.starts_with("ngmk_")
+            && key_ok
             && !data.agent_base_url.is_empty()
             && data.agent_hub_user_id > 0
             && crate::call_token::call_token_fresh(&data.agent_call_expires_at)
@@ -138,7 +151,7 @@ impl Shell {
             return Ok(crate::agent::AgentSettings {
                 base: data.agent_base_url,
                 key: data.agent_api_key,
-                model: data.agent_model,
+                model,
                 hub_user_id: data.agent_hub_user_id,
             });
         }
@@ -156,7 +169,7 @@ impl Shell {
         Ok(crate::agent::AgentSettings {
             base: saved.agent_base_url,
             key: saved.agent_api_key,
-            model: saved.agent_model,
+            model: normalize_agent_model(&saved.agent_model),
             hub_user_id: saved.agent_hub_user_id,
         })
     }

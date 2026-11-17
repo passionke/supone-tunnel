@@ -1,5 +1,5 @@
 // 作者: kejiqing
-//! 7B 工具循环。模型只看见代号，执行前还原成真实参数。
+//! 本机工具环：Hub phllm_ → supone-llm（DeepSeek）→ 本地 dispatch。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -68,12 +68,14 @@ pub struct Session {
     root: PathBuf,
     id: String,
     path: PathBuf,
-    /// NeuroGate Chat Completions 的稳定会话键（字段名 `user`）。
+    /// 本机会话键（历史字段；归因已由 Hub 钥承载）。
     conversation_user: String,
     meta_path: PathBuf,
     title: String,
     created_at: String,
     updated_at: String,
+    /// 兼容旧 meta；工具环不再用快照指纹。Author: kejiqing
+    last_context_hash: String,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -87,6 +89,8 @@ struct SessionMeta {
     created_at: String,
     #[serde(default)]
     updated_at: String,
+    #[serde(default)]
+    last_context_hash: String,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -157,6 +161,7 @@ impl Session {
             title,
             created_at,
             updated_at,
+            last_context_hash: meta.last_context_hash,
         }
     }
 
@@ -206,6 +211,7 @@ impl Session {
             self.conversation_user = new_conversation_user();
             self.title = "新对话".into();
             self.updated_at = now_stamp();
+            self.last_context_hash.clear();
             self.save_meta();
             self.persist_index();
             return;
@@ -225,6 +231,7 @@ impl Session {
             title: "新对话".into(),
             created_at: now.clone(),
             updated_at: now,
+            last_context_hash: String::new(),
         };
         let dir = conversation_dir(&self.root, &self.id);
         let _ = fs::create_dir_all(&dir);
@@ -310,6 +317,7 @@ impl Session {
             title: self.title.clone(),
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
+            last_context_hash: self.last_context_hash.clone(),
         };
         if let Ok(text) = serde_json::to_string_pretty(&meta) {
             if let Some(parent) = self.meta_path.parent() {
@@ -433,6 +441,7 @@ fn migrate_legacy(app_dir: &Path, root: &Path) {
         title: title_from_records(&records),
         created_at: now.clone(),
         updated_at: now,
+        last_context_hash: legacy.last_context_hash,
     };
     let new_transcript = dir.join("transcript.jsonl");
     let new_meta = dir.join("meta.json");
@@ -473,7 +482,7 @@ pub async fn chat(
         return Err("请输入内容".into());
     }
     ensure_not_cancelled(cancel)?;
-    // 对话凭证只走订阅 token → Hub 换取 ngmk_；无授权订阅直接返回。Author: kejiqing
+    // 订阅 token → Hub 换 phllm_ → supone-llm；工具在本机执行。Author: kejiqing
     let settings = shell.agent_settings().await?;
     session.records.push(Record::User {
         text: text.to_string(),
@@ -481,70 +490,67 @@ pub async fn chat(
     session.touch_title_from_user(text);
     session.save();
     session.save_meta();
-    chat_neurogate(shell, session, &settings, text, cancel).await
-}
 
-/// NeuroGate 当大模型：壳注入本机只读快照 + 用户原文；不靠远端 MCP。
-/// Author: kejiqing
-async fn chat_neurogate(
-    shell: &Shell,
-    session: &mut Session,
-    settings: &AgentSettings,
-    text: &str,
-    cancel: &mut watch::Receiver<bool>,
-) -> Result<Vec<UiMessage>, String> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(330))
+        .timeout(Duration::from_secs(180))
         .build()
         .map_err(|err| err.to_string())?;
-    ensure_not_cancelled(cancel)?;
-    let snapshot = shell.chat_context_snapshot().await;
-    // 远端没有本机工具：上下文必须由壳组好再调模型。Author: kejiqing
-    let prompt = format!(
-        "【本机只读快照】（由 Supone Tunnel 壳注入，回答本机状态/订阅/节点时必须以这份为准；不要说看不见或让用户去别处查已在快照里的信息）\n{snapshot}\n\n【用户】\n{text}"
-    );
-    let body = json!({
-        "model": settings.model,
-        // phub-u{hubUserId}:{本机会话键} → 远端按人归因，本机多会话不串。Author: kejiqing
-        "user": crate::call_token::neurogate_user_key(
-            settings.hub_user_id,
-            session.conversation_user(),
-        ),
-        "timeout": 300,
-        "stream": false,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ]
-    });
-    let request = client
-        .post(completions_url(&settings.base))
-        .header("Authorization", format!("Bearer {}", settings.key))
-        .json(&body)
-        .send();
-    let response = with_cancel(cancel, request)
-        .await?
-        .map_err(|err| format!("NeuroGate 请求失败: {err}"))?;
-    let status = response.status();
-    let raw = with_cancel(cancel, response.text())
-        .await?
-        .map_err(|err| err.to_string())?;
-    if !status.is_success() {
-        return Err(format!("NeuroGate 请求失败: HTTP {status} {}", short(&raw)));
+    for _ in 0..8 {
+        ensure_not_cancelled(cancel)?;
+        let messages = build_messages(shell, session).await?;
+        let response = post_chat(&client, &settings, messages, cancel).await?;
+        if let Some(calls) = response.tool_calls {
+            if !calls.is_empty() {
+                let mut stored = Vec::new();
+                for call in calls {
+                    ensure_not_cancelled(cancel)?;
+                    let raw = if call.function.arguments.trim().is_empty() {
+                        "{}".to_string()
+                    } else {
+                        call.function.arguments
+                    };
+                    let (args, result) = match session.redactor.restore_tool_args(&raw) {
+                        Ok(args) => {
+                            let result = dispatch(shell, &call.function.name, &args).await;
+                            (args, result)
+                        }
+                        Err(err) => (json!({}), format!("失败: {err}")),
+                    };
+                    stored.push(StoredCall {
+                        id: call.id,
+                        name: call.function.name,
+                        args,
+                        result,
+                    });
+                }
+                let preface = response.content.unwrap_or_default();
+                session.records.push(Record::Tools {
+                    preface: session.redactor.unmask(&preface),
+                    calls: stored,
+                });
+                session.updated_at = now_stamp();
+                session.save();
+                session.save_meta();
+                continue;
+            }
+        }
+        let reply = session
+            .redactor
+            .unmask(&response.content.unwrap_or_default());
+        let reply = if reply.trim().is_empty() {
+            "已执行。".to_string()
+        } else {
+            reply
+        };
+        session.records.push(Record::Assistant { text: reply });
+        session.updated_at = now_stamp();
+        session.save();
+        session.save_meta();
+        return Ok(session.ui_messages());
     }
-    let parsed: ChatResponse =
-        serde_json::from_str(&raw).map_err(|err| format!("NeuroGate 响应无效: {err}"))?;
-    let reply = parsed
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|choice| choice.message.content)
-        .unwrap_or_default();
-    let reply = if reply.trim().is_empty() {
-        "已执行。".to_string()
-    } else {
-        reply
-    };
-    session.records.push(Record::Assistant { text: reply });
+    session.records.push(Record::Assistant {
+        text: "已达到 8 步上限".into(),
+    });
     session.updated_at = now_stamp();
     session.save();
     session.save_meta();
@@ -748,7 +754,7 @@ pub struct AgentSettings {
     pub base: String,
     pub key: String,
     pub model: String,
-    /// Hub users.id；编进 NeuroGate `user`。Author: kejiqing
+    /// Hub users.id（换钥响应；工具环不另编 user 字段）。Author: kejiqing
     pub hub_user_id: i64,
 }
 

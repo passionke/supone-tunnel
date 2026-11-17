@@ -13,7 +13,7 @@ pub struct AppSettings {
     /// 由 Hub 换取响应写入；设置页不展示。Author: kejiqing
     #[serde(default = "default_agent_base_url")]
     pub agent_base_url: String,
-    /// 由 Hub 换取的 ngmk_；设置页不展示。Author: kejiqing
+    /// 由 Hub 换取的 phllm_；设置页不展示。Author: kejiqing
     #[serde(default)]
     pub agent_api_key: String,
     /// Hub 约定的 call_token 失效时间（UTC RFC3339）。Author: kejiqing
@@ -40,11 +40,11 @@ pub struct AppSettings {
 }
 
 fn default_agent_base_url() -> String {
-    "https://neurogate.bitkindle.com/v1".into()
+    "https://llm.bitkindle.com/v1".into()
 }
 
 fn default_agent_model() -> String {
-    "agent".into()
+    "deepseek-chat".into()
 }
 
 fn default_mcp_bind() -> String {
