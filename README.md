@@ -6,7 +6,7 @@ Also exposes the same control surface as **MCP** for external agents (PI, etc.).
 
 [中文说明](#中文)
 
-[![Windows NSIS](https://github.com/passionke/supone-tunnel/actions/workflows/windows-build.yml/badge.svg)](https://github.com/passionke/supone-tunnel/actions/workflows/windows-build.yml)
+[![Release builds](https://github.com/passionke/supone-tunnel/actions/workflows/release.yml/badge.svg)](https://github.com/passionke/supone-tunnel/actions/workflows/release.yml)
 [![Release](https://img.shields.io/github/v/release/passionke/supone-tunnel)](https://github.com/passionke/supone-tunnel/releases)
 
 ## Why
@@ -49,14 +49,19 @@ flowchart LR
 
 ## Install
 
-Download from **[Releases](https://github.com/passionke/supone-tunnel/releases)**:
+Download from **[Releases](https://github.com/passionke/supone-tunnel/releases)** (CI builds on every `v*` tag):
 
 | Platform | Artifact |
 |----------|----------|
 | Windows x64 | `Supone.Tunnel_*_x64-setup.exe` (NSIS) |
-| macOS | build with `scripts/build.sh` (installs to `/Applications`) |
+| macOS Apple Silicon | `Supone.Tunnel_*_macos-aarch64.app.zip` |
+| macOS Intel | `Supone.Tunnel_*_macos-x64.app.zip` |
+| Linux x64 (portable) | `*.AppImage` |
+| Linux x64 (Debian/Ubuntu) | `*.deb` |
 
-Windows installers are built by GitHub Actions on `v*` tags and attached to the release.
+macOS: unzip, drag `Supone Tunnel.app` to `/Applications`. Unsigned builds may need **Right-click → Open** the first time (or `xattr -dr com.apple.quarantine`).
+
+Linux AppImage: `chmod +x *.AppImage && ./Supone*.AppImage`
 
 ## Chat / credentials
 
@@ -135,7 +140,13 @@ docs/mcp-tools.md   MCP + tool contract
 ## Versioning & releases
 
 - Semver in `package.json` / `src-tauri/tauri.conf.json` / `src-tauri/Cargo.toml`
-- Tag `vX.Y.Z` → CI builds Windows NSIS → publishes [GitHub Release](https://github.com/passionke/supone-tunnel/releases) with the installer attached
+- Tag `vX.Y.Z` → CI matrix builds **Windows + macOS (arm64/x64) + Linux (AppImage/deb)** → attaches all artifacts to the [GitHub Release](https://github.com/passionke/supone-tunnel/releases)
+
+Local macOS only:
+
+```bash
+REGION=else ./scripts/build.sh   # → /Applications/Supone Tunnel.app
+```
 
 ## Contributing
 
@@ -154,7 +165,7 @@ See also [`NOTICE`](NOTICE).
 
 **Supone Tunnel** 是本机 **mihomo 壳**：订阅、TUN / 系统代理，以及能**真正改本机代理**的对话工具环（不是只读嘴炮）。同一套能力也对外部 agent 暴露为 **MCP**。
 
-- 安装：见 [Releases](https://github.com/passionke/supone-tunnel/releases)（Windows NSIS；macOS 用 `REGION=china|else ./scripts/build.sh`）
+- 安装：见 [Releases](https://github.com/passionke/supone-tunnel/releases)（Windows / macOS arm64+x64 / Linux AppImage+deb；本机 mac 也可用 `REGION=china|else ./scripts/build.sh`）
 - 对话：导入 `https://phub.supone.vip/clash/<token>` → Hub 换 `phllm_` → OpenAI 兼容口带 tools → **本机执行**
 - MCP 契约：[`docs/mcp-tools.md`](docs/mcp-tools.md)
 - 构建镜像开关：环境变量 `REGION=china` 或 `else`（唯一分叉）

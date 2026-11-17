@@ -1,0 +1,161 @@
+# author: kejiqing
+# Windows / macOS / Linux 打包；v* tag 挂到 GitHub Release。
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - ui/profile-active-cst
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+            bundles: nsis
+            rust_target: x86_64-pc-windows-msvc
+          - os: macos-14
+            name: macos-aarch64
+            bundles: app
+            rust_target: aarch64-apple-darwin
+          - os: macos-13
+            name: macos-x64
+            bundles: app
+            rust_target: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            name: linux-x64
+            bundles: appimage,deb
+            rust_target: x86_64-unknown-linux-gnu
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            ui/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.name }}
+
+      - name: Linux WebKit / bundler deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libfuse2
+
+      - name: Install npm deps
+        shell: bash
+        run: |
+          npm ci
+          npm ci --prefix ui
+
+      - name: Tauri build
+        shell: bash
+        env:
+          REGION: else
+        run: npm run build -- --bundles ${{ matrix.bundles }}
+
+      - name: macOS inject supone-priv + zip .app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="src-tauri/target/release/bundle/macos/Supone Tunnel.app"
+          test -d "$APP"
+          (cd src-tauri && cargo build --release --bin supone-priv --target ${{ matrix.rust_target }})
+          # release bin path depends on --target
+          HELPER="src-tauri/target/${{ matrix.rust_target }}/release/supone-priv"
+          if [ ! -f "$HELPER" ]; then
+            HELPER="src-tauri/target/release/supone-priv"
+          fi
+          cp "$HELPER" "$APP/Contents/MacOS/supone-priv"
+          chmod +x "$APP/Contents/MacOS/supone-priv"
+          OUT_DIR="dist-artifacts"
+          mkdir -p "$OUT_DIR"
+          VER=$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')
+          ZIP_NAME="Supone.Tunnel_${VER}_${{ matrix.name }}.app.zip"
+          ditto -c -k --keepParent "$APP" "$OUT_DIR/$ZIP_NAME"
+          ls -la "$OUT_DIR"
+
+      - name: Collect Windows artifacts
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-artifacts
+          cp src-tauri/target/release/bundle/nsis/*.exe dist-artifacts/
+          ls -la dist-artifacts
+
+      - name: Collect Linux artifacts
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-artifacts
+          cp src-tauri/target/release/bundle/appimage/*.AppImage dist-artifacts/ || true
+          cp src-tauri/target/release/bundle/deb/*.deb dist-artifacts/ || true
+          ls -la dist-artifacts
+          test -n "$(ls -A dist-artifacts)"
+
+      - name: Upload platform artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: supone-tunnel-${{ matrix.name }}
+          path: dist-artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List assets
+        run: find release-assets -type f -print
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
