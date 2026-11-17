@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Author: kejiqing -->
+<resources>
+    <string name="app_name">Supone Tunnel</string>
+    <string name="subscription_hint">订阅 URL</string>
+    <string name="btn_import">导入并启动</string>
+    <string name="btn_stop">停止</string>
+    <string name="btn_youtube">打开 YouTube</string>
+    <string name="status_idle">未运行</string>
+</resources>

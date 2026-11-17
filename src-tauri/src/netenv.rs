@@ -12,6 +12,23 @@ pub struct NetOverviewInput {
 }
 
 pub fn overview(input: &NetOverviewInput) -> String {
+    if cfg!(windows) {
+        return format!(
+            "Windows 暂不支持路由/网卡快照。mihomo TUN={} device={} auto-route={}；系统代理={}。请用 status / explain_route / probe_url。",
+            if input.tun_enabled { "开" } else { "关" },
+            if input.tun_device.is_empty() {
+                "(空)"
+            } else {
+                &input.tun_device
+            },
+            if input.auto_route { "true" } else { "false" },
+            match input.system_proxy {
+                Some(true) => "开",
+                Some(false) => "关",
+                None => "未知",
+            }
+        );
+    }
     if !cfg!(target_os = "macos") {
         return "当前仅实现 macOS 网络探测".into();
     }
@@ -52,6 +69,9 @@ pub fn overview(input: &NetOverviewInput) -> String {
 }
 
 pub fn interfaces() -> String {
+    if cfg!(windows) {
+        return "Windows 暂不支持网卡列表；请用 status / probe_url。".into();
+    }
     if !cfg!(target_os = "macos") {
         return "当前仅实现 macOS 网络探测".into();
     }
@@ -84,6 +104,9 @@ pub fn interfaces() -> String {
 }
 
 pub fn routes() -> String {
+    if cfg!(windows) {
+        return "Windows 暂不支持路由表快照；请用 explain_route / probe_url。".into();
+    }
     if !cfg!(target_os = "macos") {
         return "当前仅实现 macOS 网络探测".into();
     }
@@ -231,6 +254,9 @@ fn parse_default_iface(line: &str) -> &str {
 pub fn route_get(ip: &str) -> String {
     if ip.parse::<std::net::IpAddr>().is_err() {
         return format!("{ip} 不是 IP，跳过系统路由");
+    }
+    if cfg!(windows) {
+        return format!("{ip} Windows 暂不支持系统路由查询");
     }
     let output = Command::new("route").args(["-n", "get", ip]).output();
     let Ok(output) = output else {

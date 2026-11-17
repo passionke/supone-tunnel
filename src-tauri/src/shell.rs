@@ -12,8 +12,10 @@ use crate::profile::ProfileStore;
 use crate::netenv::{self, NetOverviewInput};
 use crate::observe::{self, ResolvedIp};
 use crate::runtime::{
-    format_conn_evidence, ConnEvidence, DelaySample, ProxyGroup, Runtime, DELAY_TEST_URL,
-    DELAY_TIMEOUT_MS,
+    bandwidth_test_url, format_conn_evidence, ConnEvidence, DelaySample, ProxyGroup, Runtime,
+    TrafficSample, BANDWIDTH_DEFAULT_TIMEOUT_MS, BANDWIDTH_MAX_BYTES, BANDWIDTH_MAX_TIMEOUT_MS,
+    DELAY_TEST_URL, DELAY_TIMEOUT_MS, STABILITY_DEFAULT_INTERVAL_MS, STABILITY_DEFAULT_SAMPLES,
+    STABILITY_MAX_INTERVAL_MS, STABILITY_MAX_SAMPLES,
 };
 use crate::settings::{AppSettings, SettingsStore, SettingsView};
 use crate::sysproxy;
@@ -161,6 +163,20 @@ impl Shell {
     pub async fn write_override(&self, yaml: &str) -> Result<(), String> {
         self.profiles.write_override(yaml)?;
         self.runtime.reload().await
+    }
+
+    /// 清空本地覆盖 → 仅订阅。内核在跑且目标为当前激活订阅时重载。
+    /// Author: kejiqing
+    pub async fn reset_override(&self, id: Option<&str>) -> Result<String, String> {
+        let meta = self.profiles.reset_override(id)?;
+        let active = self.profiles.active_id();
+        if self.runtime.running() && active.as_deref() == Some(meta.id.as_str()) {
+            self.runtime.reload().await?;
+        }
+        Ok(format!(
+            "已清空订阅「{}」的本地覆盖，回到仅订阅原文",
+            meta.name
+        ))
     }
 
     pub async fn start(&self) -> Result<Status, String> {
@@ -435,6 +451,27 @@ impl Shell {
         Ok(format!("已选择 {group} -> {name}"))
     }
 
+    /// 新建或按名编辑代理组（本地覆盖，刷新订阅不冲掉）。
+    /// Author: kejiqing
+    pub async fn upsert_proxy_group(
+        &self,
+        name: &str,
+        group_type: &str,
+        proxies: &[String],
+        url: Option<&str>,
+        interval: Option<u64>,
+    ) -> Result<String, String> {
+        let (created, summary) =
+            self.profiles
+                .upsert_proxy_group(name, group_type, proxies, url, interval)?;
+        self.runtime.reload().await?;
+        let verb = if created { "已新建" } else { "已更新" };
+        Ok(format!(
+            "{verb}代理组 {summary}。刷新订阅不会冲掉；清空用 reset_override。\n{}",
+            self.profiles.proxy_group_upserts_text()
+        ))
+    }
+
     /// 测单个节点延迟。只读，不切换当前节点。
     /// Author: kejiqing
     pub async fn test_delay_text(&self, name: &str) -> Result<String, String> {
@@ -459,6 +496,175 @@ impl Shell {
         Ok(format_delay("全部节点", &samples))
     }
 
+    /// 经 mixed 测当前出口吞吐（Mbps）。不切换节点，不是延迟。
+    /// Author: kejiqing
+    pub async fn test_bandwidth_text(&self, timeout_ms: Option<u64>) -> Result<String, String> {
+        if !self.runtime.running() {
+            return Err("内核未运行".into());
+        }
+        let mixed = self
+            .runtime
+            .configs()
+            .await
+            .ok()
+            .and_then(|cfg| cfg.mixed_port)
+            .unwrap_or_else(|| self.profiles.configured_mixed_port());
+        let timeout_ms = timeout_ms
+            .unwrap_or(BANDWIDTH_DEFAULT_TIMEOUT_MS)
+            .clamp(2_000, BANDWIDTH_MAX_TIMEOUT_MS);
+        let url = bandwidth_test_url();
+        let proxy = reqwest::Proxy::all(format!("http://127.0.0.1:{mixed}"))
+            .map_err(|err| format!("mixed 代理无效: {err}"))?;
+        let client = reqwest::Client::builder()
+            .proxy(proxy)
+            .timeout(Duration::from_millis(timeout_ms))
+            .connect_timeout(Duration::from_millis(timeout_ms.min(8_000)))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .map_err(|err| format!("带宽测速客户端失败: {err}"))?;
+
+        let started = Instant::now();
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|err| format!("带宽测速请求失败: {err}"))?;
+        let status = response.status().as_u16();
+        if !(200..400).contains(&status) {
+            return Err(format!("带宽测速 HTTP {status}"));
+        }
+        let mut stream = response.bytes_stream();
+        let mut bytes: u64 = 0;
+        use futures_util::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|err| format!("带宽测速读流失败: {err}"))?;
+            bytes = bytes.saturating_add(chunk.len() as u64);
+            if bytes >= BANDWIDTH_MAX_BYTES || started.elapsed().as_millis() as u64 >= timeout_ms {
+                break;
+            }
+        }
+        let elapsed = started.elapsed();
+        let elapsed_ms = elapsed.as_millis().max(1) as f64;
+        let mbps = (bytes as f64 * 8.0) / (elapsed_ms * 1000.0);
+        Ok(serde_json::json!({
+            "kind": "bandwidth",
+            "url": url,
+            "path": format!("mixed:{mixed}"),
+            "region": std::env::var("REGION").unwrap_or_else(|_| "default".into()),
+            "httpStatus": status,
+            "bytes": bytes,
+            "elapsedMs": elapsed_ms.round() as u64,
+            "mbps": (mbps * 100.0).round() / 100.0,
+            "timeoutMs": timeout_ms,
+            "maxBytes": BANDWIDTH_MAX_BYTES,
+            "note": "当前生效出口吞吐；不切换节点"
+        })
+        .to_string())
+    }
+
+    /// 对指定节点（或当前出口）重复延迟采样，回报抖动/失败率。不是带宽。
+    /// Author: kejiqing
+    pub async fn test_stability_text(
+        &self,
+        name: Option<&str>,
+        samples: Option<u32>,
+        interval_ms: Option<u64>,
+    ) -> Result<String, String> {
+        if !self.runtime.running() {
+            return Err("内核未运行".into());
+        }
+        let count = samples
+            .unwrap_or(STABILITY_DEFAULT_SAMPLES)
+            .clamp(2, STABILITY_MAX_SAMPLES);
+        let interval_ms = interval_ms
+            .unwrap_or(STABILITY_DEFAULT_INTERVAL_MS)
+            .clamp(0, STABILITY_MAX_INTERVAL_MS);
+        let name = name.map(str::trim).filter(|s| !s.is_empty());
+
+        let mut delays: Vec<Option<u32>> = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            if i > 0 && interval_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            }
+            let sample = match name {
+                Some(node) => self.runtime.proxy_delay(node).await?,
+                None => {
+                    let ms = self.probe_latency_via_mixed().await;
+                    DelaySample {
+                        name: "current-exit".into(),
+                        delay_ms: ms,
+                    }
+                }
+            };
+            delays.push(sample.delay_ms);
+        }
+
+        let ok: Vec<u32> = delays.iter().copied().flatten().collect();
+        let fail = delays.len() - ok.len();
+        let (min, max, avg, jitter) = if ok.is_empty() {
+            (None, None, None, None)
+        } else {
+            let min = *ok.iter().min().unwrap();
+            let max = *ok.iter().max().unwrap();
+            let sum: u64 = ok.iter().map(|v| *v as u64).sum();
+            let avg = (sum as f64) / (ok.len() as f64);
+            let mut diffs = Vec::new();
+            for window in ok.windows(2) {
+                diffs.push((window[0] as i64 - window[1] as i64).unsigned_abs() as u32);
+            }
+            let jitter = if diffs.is_empty() {
+                0.0
+            } else {
+                diffs.iter().map(|v| *v as f64).sum::<f64>() / diffs.len() as f64
+            };
+            (Some(min), Some(max), Some(avg), Some(jitter))
+        };
+
+        Ok(serde_json::json!({
+            "kind": "stability",
+            "target": name.unwrap_or("current-exit"),
+            "samples": count,
+            "intervalMs": interval_ms,
+            "delaysMs": delays,
+            "ok": ok.len(),
+            "fail": fail,
+            "failRate": ((fail as f64) / (delays.len() as f64) * 1000.0).round() / 10.0,
+            "minMs": min,
+            "maxMs": max,
+            "avgMs": avg.map(|v| (v * 10.0).round() / 10.0),
+            "jitterMs": jitter.map(|v| (v * 10.0).round() / 10.0),
+            "note": "延迟采样统计，不是带宽；指定 name 时测该节点且不切换"
+        })
+        .to_string())
+    }
+
+    /// 经 mixed 对延迟探测 URL 做一次 RTT 采样（当前出口）。
+    /// Author: kejiqing
+    async fn probe_latency_via_mixed(&self) -> Option<u32> {
+        let mixed = self
+            .runtime
+            .configs()
+            .await
+            .ok()
+            .and_then(|cfg| cfg.mixed_port)
+            .unwrap_or_else(|| self.profiles.configured_mixed_port());
+        let proxy = reqwest::Proxy::all(format!("http://127.0.0.1:{mixed}")).ok()?;
+        let client = reqwest::Client::builder()
+            .proxy(proxy)
+            .timeout(Duration::from_millis(DELAY_TIMEOUT_MS))
+            .connect_timeout(Duration::from_millis(DELAY_TIMEOUT_MS))
+            .build()
+            .ok()?;
+        let started = Instant::now();
+        match client.get(DELAY_TEST_URL).send().await {
+            Ok(response) => {
+                drop(response);
+                Some(started.elapsed().as_millis().min(u32::MAX as u128) as u32)
+            }
+            Err(_) => None,
+        }
+    }
+
     pub async fn set_mixed_port(&self, port: u16) -> Result<String, String> {
         if port == 0 {
             return Err("端口无效".into());
@@ -470,6 +676,9 @@ impl Shell {
     }
 
     pub async fn set_tun(&self, enable: bool) -> Result<String, String> {
+        if enable && cfg!(windows) {
+            return Err("Windows 本期不支持 TUN，请用系统代理（set_system_proxy）".into());
+        }
         let tun = mapping(vec![("enable".into(), Value::Bool(enable))]);
         self.profiles
             .patch_override(mapping(vec![("tun".into(), tun)]))?;
@@ -520,6 +729,11 @@ impl Shell {
             return Ok(Vec::new());
         }
         self.runtime.groups().await
+    }
+
+    /// 瞬时上下行；内核未跑时为 0 + running=false。Author: kejiqing
+    pub async fn traffic_sample(&self) -> Result<TrafficSample, String> {
+        self.runtime.traffic_sample().await
     }
 
     pub async fn list_rules_text(&self) -> Result<String, String> {
@@ -922,6 +1136,9 @@ fn tcp_open(port: u16) -> bool {
 }
 
 fn os_dns_summary() -> String {
+    if cfg!(windows) {
+        return "Windows 暂不提供系统 DNS 摘要".into();
+    }
     let output = std::process::Command::new("scutil")
         .arg("--dns")
         .output();

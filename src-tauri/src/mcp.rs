@@ -283,6 +283,21 @@ async fn call_tool(shell: &Shell, name: &str, args: &Value) -> Result<String, St
             shell.test_delay_text(name).await
         }
         "supone_test_all_delays" => shell.test_all_delays_text().await,
+        "supone_test_bandwidth" => {
+            let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64());
+            shell.test_bandwidth_text(timeout_ms).await
+        }
+        "supone_test_stability" => {
+            let name = args.get("name").and_then(|v| v.as_str());
+            let samples = args
+                .get("samples")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let interval_ms = args.get("interval_ms").and_then(|v| v.as_u64());
+            shell
+                .test_stability_text(name, samples, interval_ms)
+                .await
+        }
         "supone_list_profiles" => shell.list_text(),
         "supone_import_subscription" => {
             let url = arg_str(args, "url")?;
@@ -300,6 +315,10 @@ async fn call_tool(shell: &Shell, name: &str, args: &Value) -> Result<String, St
             let id = arg_str(args, "id")?;
             shell.activate_profile(id).await
         }
+        "supone_reset_override" => {
+            let id = args.get("id").and_then(|v| v.as_str());
+            shell.reset_override(id).await
+        }
         "supone_start_core" => shell.start().await.map(|_| "内核已启动".into()),
         "supone_stop_core" => shell.stop().await.map(|_| "内核已停止".into()),
         "supone_set_mode" => {
@@ -310,6 +329,19 @@ async fn call_tool(shell: &Shell, name: &str, args: &Value) -> Result<String, St
             let group = arg_str(args, "group")?;
             let name = arg_str(args, "name")?;
             shell.select_proxy(group, name).await
+        }
+        "supone_upsert_proxy_group" => {
+            let name = arg_str(args, "name")?;
+            let group_type = args
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("select");
+            let proxies = arg_string_list(args, "proxies")?;
+            let url = args.get("url").and_then(|v| v.as_str());
+            let interval = args.get("interval").and_then(|v| v.as_u64());
+            shell
+                .upsert_proxy_group(name, group_type, &proxies, url, interval)
+                .await
         }
         "supone_set_tun" => {
             let enable = arg_bool(args, "enable")?;
@@ -404,14 +436,56 @@ fn tool_schemas() -> Vec<Value> {
             "测全部叶子节点延迟（毫秒），按延迟排序。不切换节点，不是带宽。节点多时较慢。",
             json!({"type":"object","properties":{}}),
         ),
+        tool(
+            "supone_test_bandwidth",
+            "经 mixed 测当前出口吞吐（Mbps）。限时截断下载；REGION=china 用国内源，否则 Cloudflare。不切换节点。",
+            json!({
+                "type":"object",
+                "properties":{
+                    "timeout_ms":{"type":"integer","minimum":2000,"maximum":30000,"description":"默认 12000"}
+                }
+            }),
+        ),
+        tool(
+            "supone_test_stability",
+            "延迟采样统计（min/avg/max/jitter/失败率）。指定 name 测该节点且不切换；省略则测当前出口。不是带宽。",
+            json!({
+                "type":"object",
+                "properties":{
+                    "name":{"type":"string","description":"叶子节点名；省略=当前出口"},
+                    "samples":{"type":"integer","minimum":2,"maximum":20,"description":"默认 5"},
+                    "interval_ms":{"type":"integer","minimum":0,"maximum":5000,"description":"采样间隔，默认 400"}
+                }
+            }),
+        ),
         tool("supone_list_profiles", "订阅列表", json!({"type":"object","properties":{}})),
         tool("supone_import_subscription", "导入订阅", json!({"type":"object","properties":{"url":{"type":"string"},"name":{"type":"string"}},"required":["url"]})),
         tool("supone_refresh_subscription", "刷新订阅", json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})),
         tool("supone_activate_profile", "切换订阅", json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})),
+        tool(
+            "supone_reset_override",
+            "清空本地覆盖，回到仅订阅原文（规则/DNS/代理组/TUN 排除等一并清除）。不改 remote。id 省略则当前激活订阅。",
+            json!({"type":"object","properties":{"id":{"type":"string"}}}),
+        ),
         tool("supone_start_core", "启动 mihomo", json!({"type":"object","properties":{}})),
         tool("supone_stop_core", "停止 mihomo", json!({"type":"object","properties":{}})),
         tool("supone_set_mode", "设置模式", json!({"type":"object","properties":{"mode":{"type":"string","enum":["rule","global","direct"]}},"required":["mode"]})),
         tool("supone_select_proxy", "选择节点", json!({"type":"object","properties":{"group":{"type":"string"},"name":{"type":"string"}},"required":["group","name"]})),
+        tool(
+            "supone_upsert_proxy_group",
+            "新建或按名编辑代理组（写入本地覆盖，刷新订阅不冲掉）。成员须来自 list_nodes / 已有组 / DIRECT|REJECT。新建后可用 prepend_rule 把流量指到该组。",
+            json!({
+                "type":"object",
+                "properties":{
+                    "name":{"type":"string","description":"组名；同名则覆盖（含改订阅原文里的组）"},
+                    "type":{"type":"string","enum":["select","url-test","fallback","load-balance"],"description":"默认 select"},
+                    "proxies":{"type":"array","items":{"type":"string"},"minItems":1,"description":"成员：叶子节点名、其它组名或内置策略"},
+                    "url":{"type":"string","description":"url-test/fallback/load-balance 测活 URL；省略则用 gstatic generate_204"},
+                    "interval":{"type":"integer","minimum":1,"maximum":86400,"description":"测活间隔秒；默认 300"}
+                },
+                "required":["name","proxies"]
+            }),
+        ),
         tool("supone_set_tun", "开关 TUN", json!({"type":"object","properties":{"enable":{"type":"boolean"}},"required":["enable"]})),
         tool("supone_set_system_proxy", "开关系统代理（指向 mixed 口；开时需内核已运行）", json!({"type":"object","properties":{"enable":{"type":"boolean"}},"required":["enable"]})),
         tool("supone_set_allow_lan", "开关 allow-lan（是否允许局域网访问 mixed 口）", json!({"type":"object","properties":{"enable":{"type":"boolean"}},"required":["enable"]})),
@@ -486,6 +560,24 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
         .and_then(|v| v.as_str())
         .filter(|v| !v.trim().is_empty())
         .ok_or_else(|| format!("缺少参数 {key}"))
+}
+
+fn arg_string_list(args: &Value, key: &str) -> Result<Vec<String>, String> {
+    let items = args
+        .get(key)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("缺少参数 {key}"))?;
+    if items.is_empty() {
+        return Err(format!("{key} 不能为空"));
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(text) = item.as_str().map(str::trim).filter(|v| !v.is_empty()) else {
+            return Err(format!("{key} 须是非空字符串数组"));
+        };
+        out.push(text.to_string());
+    }
+    Ok(out)
 }
 
 fn arg_bool(args: &Value, key: &str) -> Result<bool, String> {

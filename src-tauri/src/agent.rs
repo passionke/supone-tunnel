@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::watch;
 
 use crate::redact::Redactor;
 use crate::shell::Shell;
@@ -25,12 +26,23 @@ ip_、sec_、url_、host_ 后接 8 位十六进制是代号，必须原样复制
 
 const HISTORY_LIMIT: usize = 30;
 const MODEL_TEXT_LIMIT: usize = 2500;
+const TITLE_LIMIT: usize = 40;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UiMessage {
     pub role: String,
     pub text: String,
+}
+
+/// 对话列表项（侧栏/下拉）。Author: kejiqing
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationSummary {
+    pub id: String,
+    pub title: String,
+    pub updated_at: String,
+    pub active: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -52,10 +64,16 @@ struct StoredCall {
 pub struct Session {
     redactor: Redactor,
     records: Vec<Record>,
+    /// `app_data/conversations/`
+    root: PathBuf,
+    id: String,
     path: PathBuf,
     /// NeuroGate Chat Completions 的稳定会话键（字段名 `user`）。
     conversation_user: String,
     meta_path: PathBuf,
+    title: String,
+    created_at: String,
+    updated_at: String,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -63,40 +81,178 @@ pub struct Session {
 struct SessionMeta {
     #[serde(default)]
     conversation_user: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ConversationIndex {
+    #[serde(default)]
+    active_id: String,
 }
 
 impl Session {
-    pub fn open(dir: PathBuf) -> Self {
+    pub fn open(app_dir: PathBuf) -> Self {
+        let root = app_dir.join("conversations");
+        let _ = fs::create_dir_all(&root);
+        migrate_legacy(&app_dir, &root);
+
+        let index = load_index(&root);
+        let id = if !index.active_id.trim().is_empty() && conversation_dir(&root, &index.active_id).is_dir()
+        {
+            index.active_id
+        } else if let Some(id) = newest_conversation_id(&root) {
+            id
+        } else {
+            new_conversation_id()
+        };
+
+        let session = Self::load_into(root, id);
+        session.persist_index();
+        session.save_meta();
+        session
+    }
+
+    fn load_into(root: PathBuf, id: String) -> Self {
+        let dir = conversation_dir(&root, &id);
+        let _ = fs::create_dir_all(&dir);
         let path = dir.join("transcript.jsonl");
-        let meta_path = dir.join("conversation.json");
+        let meta_path = dir.join("meta.json");
         let records = load_records(&path);
         let meta = load_meta(&meta_path);
+        let now = now_stamp();
         let conversation_user = if meta.conversation_user.trim().is_empty() {
             new_conversation_user()
         } else {
             meta.conversation_user
         };
-        let session = Self {
+        let title = if meta.title.trim().is_empty() {
+            title_from_records(&records)
+        } else {
+            meta.title
+        };
+        let created_at = if meta.created_at.trim().is_empty() {
+            now.clone()
+        } else {
+            meta.created_at
+        };
+        let updated_at = if meta.updated_at.trim().is_empty() {
+            now
+        } else {
+            meta.updated_at
+        };
+        Self {
             redactor: Redactor::new(),
             records,
+            root,
+            id,
             path,
             conversation_user,
             meta_path,
-        };
-        session.save_meta();
-        session
+            title,
+            created_at,
+            updated_at,
+        }
     }
 
     pub fn conversation_user(&self) -> &str {
         &self.conversation_user
     }
 
-    /// 开新对话：清空本地 transcript，换新的 NeuroGate `user` 会话键。
+    pub fn list_conversations(&self) -> Vec<ConversationSummary> {
+        let mut items = Vec::new();
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return items;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(id) = path.file_name().and_then(|name| name.to_str()).map(str::to_string) else {
+                continue;
+            };
+            let meta = load_meta(&path.join("meta.json"));
+            let records = load_records(&path.join("transcript.jsonl"));
+            let title = if meta.title.trim().is_empty() {
+                title_from_records(&records)
+            } else {
+                meta.title
+            };
+            let updated_at = if meta.updated_at.trim().is_empty() {
+                meta.created_at
+            } else {
+                meta.updated_at
+            };
+            items.push(ConversationSummary {
+                id: id.clone(),
+                title,
+                updated_at,
+                active: id == self.id,
+            });
+        }
+        items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        items
+    }
+
+    /// 开新对话：有内容则保留当前归档，切到空白会话。Author: kejiqing
     pub fn new_conversation(&mut self) {
-        self.records.clear();
-        self.conversation_user = new_conversation_user();
+        if self.records.is_empty() {
+            self.conversation_user = new_conversation_user();
+            self.title = "新对话".into();
+            self.updated_at = now_stamp();
+            self.save_meta();
+            self.persist_index();
+            return;
+        }
         self.save();
         self.save_meta();
+        let id = new_conversation_id();
+        let now = now_stamp();
+        *self = Self {
+            redactor: Redactor::new(),
+            records: Vec::new(),
+            root: self.root.clone(),
+            id,
+            path: PathBuf::new(),
+            conversation_user: new_conversation_user(),
+            meta_path: PathBuf::new(),
+            title: "新对话".into(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let dir = conversation_dir(&self.root, &self.id);
+        let _ = fs::create_dir_all(&dir);
+        self.path = dir.join("transcript.jsonl");
+        self.meta_path = dir.join("meta.json");
+        self.save();
+        self.save_meta();
+        self.persist_index();
+    }
+
+    pub fn open_conversation(&mut self, id: &str) -> Result<(), String> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err("对话 id 无效".into());
+        }
+        if id == self.id {
+            return Ok(());
+        }
+        let dir = conversation_dir(&self.root, id);
+        if !dir.is_dir() {
+            return Err("对话不存在".into());
+        }
+        self.save();
+        self.save_meta();
+        *self = Self::load_into(self.root.clone(), id.to_string());
+        self.persist_index();
+        self.save_meta();
+        Ok(())
     }
 
     pub fn ui_messages(&self) -> Vec<UiMessage> {
@@ -124,6 +280,13 @@ impl Session {
         messages
     }
 
+    fn touch_title_from_user(&mut self, text: &str) {
+        if self.title.trim().is_empty() || self.title == "新对话" {
+            self.title = truncate_title(text);
+        }
+        self.updated_at = now_stamp();
+    }
+
     fn save(&self) {
         let mut text = String::new();
         for record in &self.records {
@@ -144,6 +307,9 @@ impl Session {
     fn save_meta(&self) {
         let meta = SessionMeta {
             conversation_user: self.conversation_user.clone(),
+            title: self.title.clone(),
+            created_at: self.created_at.clone(),
+            updated_at: self.updated_at.clone(),
         };
         if let Ok(text) = serde_json::to_string_pretty(&meta) {
             if let Some(parent) = self.meta_path.parent() {
@@ -155,10 +321,138 @@ impl Session {
             }
         }
     }
+
+    fn persist_index(&self) {
+        let index = ConversationIndex {
+            active_id: self.id.clone(),
+        };
+        let path = self.root.join("index.json");
+        if let Ok(text) = serde_json::to_string_pretty(&index) {
+            let tmp = path.with_extension("tmp");
+            if fs::write(&tmp, text.as_bytes()).is_ok() {
+                let _ = fs::rename(&tmp, &path);
+            }
+        }
+    }
 }
 
 fn new_conversation_user() -> String {
     format!("supone-{}", uuid::Uuid::new_v4())
+}
+
+fn new_conversation_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn conversation_dir(root: &Path, id: &str) -> PathBuf {
+    root.join(id)
+}
+
+fn now_stamp() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn truncate_title(text: &str) -> String {
+    let trimmed = text.trim().replace('\n', " ");
+    if trimmed.is_empty() {
+        return "新对话".into();
+    }
+    let mut out: String = trimmed.chars().take(TITLE_LIMIT).collect();
+    if trimmed.chars().count() > TITLE_LIMIT {
+        out.push('…');
+    }
+    out
+}
+
+fn title_from_records(records: &[Record]) -> String {
+    for record in records {
+        if let Record::User { text } = record {
+            return truncate_title(text);
+        }
+    }
+    "新对话".into()
+}
+
+fn load_index(root: &Path) -> ConversationIndex {
+    let path = root.join("index.json");
+    let Ok(text) = fs::read_to_string(path) else {
+        return ConversationIndex::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn newest_conversation_id(root: &Path) -> Option<String> {
+    let mut best: Option<(String, String)> = None;
+    let Ok(entries) = fs::read_dir(root) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(id) = path.file_name().and_then(|name| name.to_str()).map(str::to_string) else {
+            continue;
+        };
+        let meta = load_meta(&path.join("meta.json"));
+        let stamp = if meta.updated_at.trim().is_empty() {
+            meta.created_at
+        } else {
+            meta.updated_at
+        };
+        match &best {
+            Some((_, prev)) if prev >= &stamp => {}
+            _ => best = Some((id, stamp)),
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
+/// 把旧版根目录 transcript/conversation 迁到 conversations/。Author: kejiqing
+fn migrate_legacy(app_dir: &Path, root: &Path) {
+    let legacy_transcript = app_dir.join("transcript.jsonl");
+    let legacy_meta = app_dir.join("conversation.json");
+    if !legacy_transcript.exists() && !legacy_meta.exists() {
+        return;
+    }
+    if newest_conversation_id(root).is_some() {
+        return;
+    }
+    let id = new_conversation_id();
+    let dir = conversation_dir(root, &id);
+    let _ = fs::create_dir_all(&dir);
+    let records = load_records(&legacy_transcript);
+    let legacy = load_meta(&legacy_meta);
+    let now = now_stamp();
+    let meta = SessionMeta {
+        conversation_user: if legacy.conversation_user.trim().is_empty() {
+            new_conversation_user()
+        } else {
+            legacy.conversation_user
+        },
+        title: title_from_records(&records),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    let new_transcript = dir.join("transcript.jsonl");
+    let new_meta = dir.join("meta.json");
+    if legacy_transcript.exists() {
+        let _ = fs::copy(&legacy_transcript, &new_transcript);
+    } else {
+        let _ = fs::write(&new_transcript, b"");
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&meta) {
+        let _ = fs::write(&new_meta, text.as_bytes());
+    }
+    let index = ConversationIndex { active_id: id };
+    if let Ok(text) = serde_json::to_string_pretty(&index) {
+        let _ = fs::write(root.join("index.json"), text.as_bytes());
+    }
+    let _ = fs::rename(
+        &legacy_transcript,
+        app_dir.join("transcript.jsonl.migrated"),
+    );
+    let _ = fs::rename(&legacy_meta, app_dir.join("conversation.json.migrated"));
 }
 
 fn load_meta(path: &Path) -> SessionMeta {
@@ -172,30 +466,40 @@ fn is_neurogate(settings: &AgentSettings) -> bool {
     settings.key.starts_with("ngmk_")
 }
 
-pub async fn chat(shell: &Shell, session: &mut Session, text: &str) -> Result<Vec<UiMessage>, String> {
+pub async fn chat(
+    shell: &Shell,
+    session: &mut Session,
+    text: &str,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<Vec<UiMessage>, String> {
     let text = text.trim();
     if text.is_empty() {
         return Err("请输入内容".into());
     }
+    ensure_not_cancelled(cancel)?;
     let settings = shell.agent_settings()?;
     session.records.push(Record::User {
         text: text.to_string(),
     });
+    session.touch_title_from_user(text);
     session.save();
+    session.save_meta();
     if is_neurogate(&settings) {
-        return chat_neurogate(session, &settings, text).await;
+        return chat_neurogate(session, &settings, text, cancel).await;
     }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|err| err.to_string())?;
     for _ in 0..8 {
+        ensure_not_cancelled(cancel)?;
         let messages = build_messages(shell, session).await?;
-        let response = post_chat(&client, &settings, messages).await?;
+        let response = post_chat(&client, &settings, messages, cancel).await?;
         if let Some(calls) = response.tool_calls {
             if !calls.is_empty() {
                 let mut stored = Vec::new();
                 for call in calls {
+                    ensure_not_cancelled(cancel)?;
                     let raw = if call.function.arguments.trim().is_empty() {
                         "{}".to_string()
                     } else {
@@ -220,7 +524,9 @@ pub async fn chat(shell: &Shell, session: &mut Session, text: &str) -> Result<Ve
                     preface: session.redactor.unmask(&preface),
                     calls: stored,
                 });
+                session.updated_at = now_stamp();
                 session.save();
+                session.save_meta();
                 continue;
             }
         }
@@ -233,13 +539,17 @@ pub async fn chat(shell: &Shell, session: &mut Session, text: &str) -> Result<Ve
             reply
         };
         session.records.push(Record::Assistant { text: reply });
+        session.updated_at = now_stamp();
         session.save();
+        session.save_meta();
         return Ok(session.ui_messages());
     }
     session.records.push(Record::Assistant {
         text: "已达到 8 步上限".into(),
     });
+    session.updated_at = now_stamp();
     session.save();
+    session.save_meta();
     Ok(session.ui_messages())
 }
 
@@ -249,6 +559,7 @@ async fn chat_neurogate(
     session: &mut Session,
     settings: &AgentSettings,
     text: &str,
+    cancel: &mut watch::Receiver<bool>,
 ) -> Result<Vec<UiMessage>, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(330))
@@ -263,15 +574,18 @@ async fn chat_neurogate(
             {"role": "user", "content": text}
         ]
     });
-    let response = client
+    let request = client
         .post(completions_url(&settings.base))
         .header("Authorization", format!("Bearer {}", settings.key))
         .json(&body)
-        .send()
-        .await
+        .send();
+    let response = with_cancel(cancel, request)
+        .await?
         .map_err(|err| format!("NeuroGate 请求失败: {err}"))?;
     let status = response.status();
-    let raw = response.text().await.map_err(|err| err.to_string())?;
+    let raw = with_cancel(cancel, response.text())
+        .await?
+        .map_err(|err| err.to_string())?;
     if !status.is_success() {
         return Err(format!("NeuroGate 请求失败: HTTP {status} {}", short(&raw)));
     }
@@ -289,8 +603,36 @@ async fn chat_neurogate(
         reply
     };
     session.records.push(Record::Assistant { text: reply });
+    session.updated_at = now_stamp();
     session.save();
+    session.save_meta();
     Ok(session.ui_messages())
+}
+
+fn ensure_not_cancelled(cancel: &watch::Receiver<bool>) -> Result<(), String> {
+    if *cancel.borrow() {
+        Err("已取消".into())
+    } else {
+        Ok(())
+    }
+}
+
+async fn with_cancel<T>(
+    cancel: &mut watch::Receiver<bool>,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    ensure_not_cancelled(cancel)?;
+    tokio::select! {
+        result = fut => Ok(result),
+        changed = cancel.changed() => {
+            let _ = changed;
+            if *cancel.borrow() {
+                Err("已取消".into())
+            } else {
+                Err("已取消".into())
+            }
+        }
+    }
 }
 
 async fn dispatch(shell: &Shell, name: &str, args: &Value) -> String {
@@ -478,6 +820,7 @@ async fn post_chat(
     client: &reqwest::Client,
     settings: &AgentSettings,
     messages: Vec<Value>,
+    cancel: &mut watch::Receiver<bool>,
 ) -> Result<AssistantMessage, String> {
     let body = json!({
         "model": settings.model,
@@ -487,15 +830,18 @@ async fn post_chat(
         "messages": messages,
         "tools": tool_schemas()
     });
-    let response = client
+    let request = client
         .post(completions_url(&settings.base))
         .header("Authorization", format!("Bearer {}", settings.key))
         .json(&body)
-        .send()
-        .await
+        .send();
+    let response = with_cancel(cancel, request)
+        .await?
         .map_err(|err| format!("模型请求失败: {err}"))?;
     let status = response.status();
-    let text = response.text().await.map_err(|err| err.to_string())?;
+    let text = with_cancel(cancel, response.text())
+        .await?
+        .map_err(|err| err.to_string())?;
     if !status.is_success() {
         return Err(format!("模型请求失败: HTTP {status} {}", short(&text)));
     }
@@ -722,4 +1068,48 @@ fn tool(name: &str, description: &str, parameters: Value) -> Value {
         "type": "function",
         "function": { "name": name, "description": description, "parameters": parameters }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conversation_history_keeps_prior_on_new() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = Session::open(dir.path().to_path_buf());
+        session.records.push(Record::User {
+            text: "把模式改成规则".into(),
+        });
+        session.touch_title_from_user("把模式改成规则");
+        session.save();
+        session.save_meta();
+
+        session.new_conversation();
+        assert!(session.records.is_empty());
+        let list = session.list_conversations();
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().any(|item| item.title.contains("模式")));
+        assert!(list.iter().any(|item| item.active));
+    }
+
+    #[test]
+    fn migrate_legacy_root_transcript() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = dir.path();
+        fs::write(
+            app.join("transcript.jsonl"),
+            r#"{"type":"user","text":"旧对话"}"#.as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            app.join("conversation.json"),
+            r#"{"conversationUser":"supone-legacy"}"#,
+        )
+        .unwrap();
+        let session = Session::open(app.to_path_buf());
+        assert_eq!(session.ui_messages().len(), 1);
+        assert!(app.join("conversations").is_dir());
+        assert!(app.join("transcript.jsonl.migrated").exists());
+    }
 }

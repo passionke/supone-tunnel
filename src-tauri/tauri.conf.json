@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "top.passionke.supone-tunnel",
   "build": {
-    "beforeDevCommand": "bash scripts/ui-dev.sh",
+    "beforeDevCommand": "npm --prefix ui run dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "bash scripts/ui-build.sh",
+    "beforeBuildCommand": "npm --prefix ui run build",
     "frontendDist": "../ui/dist"
   },
   "app": {

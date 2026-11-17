@@ -15,15 +15,21 @@ mod sysproxy;
 
 pub use privkill::main_from_args as privkill_main;
 
-use agent::{Session, UiMessage};
+use agent::{ConversationSummary, Session, UiMessage};
+use std::sync::Arc;
+use tokio::sync::watch;
 use profile::ProfileMeta;
-use runtime::ProxyGroup;
+use runtime::{ProxyGroup, TrafficSample};
 use settings::{AppSettings, SettingsView};
 use shell::{Shell, Status};
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, Submenu};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
 
+#[cfg(desktop)]
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, Submenu};
+#[cfg(desktop)]
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+#[cfg(desktop)]
 struct TrayModeMenu {
     rule: CheckMenuItem<tauri::Wry>,
     global: CheckMenuItem<tauri::Wry>,
@@ -33,7 +39,10 @@ struct TrayModeMenu {
 struct AppState {
     shell: std::sync::Arc<Shell>,
     session: tokio::sync::Mutex<Session>,
+    /// 对话进行中取消：true 表示用户点了停止。Author: kejiqing
+    chat_cancel: Arc<watch::Sender<bool>>,
     mcp_stop: std::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    #[cfg(desktop)]
     tray_mode: TrayModeMenu,
 }
 
@@ -53,13 +62,21 @@ async fn runtime_stop(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn runtime_traffic(state: State<'_, AppState>) -> Result<TrafficSample, String> {
+    state.shell.traffic_sample().await
+}
+
+#[tauri::command]
 async fn runtime_set_mode(
     app: AppHandle,
     state: State<'_, AppState>,
     mode: String,
 ) -> Result<String, String> {
     let text = state.shell.set_mode(&mode).await?;
+    #[cfg(desktop)]
     sync_tray_mode(&app);
+    #[cfg(mobile)]
+    let _ = app;
     Ok(text)
 }
 
@@ -112,6 +129,14 @@ async fn profile_write_override(state: State<'_, AppState>, yaml: String) -> Res
 }
 
 #[tauri::command]
+async fn profile_reset_override(
+    state: State<'_, AppState>,
+    id: Option<String>,
+) -> Result<String, String> {
+    state.shell.reset_override(id.as_deref()).await
+}
+
+#[tauri::command]
 async fn runtime_set_tun(state: State<'_, AppState>, enable: bool) -> Result<Status, String> {
     state.shell.set_tun(enable).await?;
     state.shell.status().await
@@ -133,15 +158,41 @@ async fn agent_history(state: State<'_, AppState>) -> Result<Vec<UiMessage>, Str
 }
 
 #[tauri::command]
+async fn agent_list_conversations(
+    state: State<'_, AppState>,
+) -> Result<Vec<ConversationSummary>, String> {
+    let session = state.session.lock().await;
+    Ok(session.list_conversations())
+}
+
+#[tauri::command]
 async fn agent_send(state: State<'_, AppState>, text: String) -> Result<Vec<UiMessage>, String> {
+    let _ = state.chat_cancel.send(false);
+    let mut cancel = state.chat_cancel.subscribe();
     let mut session = state.session.lock().await;
-    agent::chat(&state.shell, &mut session, &text).await
+    agent::chat(&state.shell, &mut session, &text, &mut cancel).await
+}
+
+#[tauri::command]
+async fn agent_cancel(state: State<'_, AppState>) -> Result<(), String> {
+    let _ = state.chat_cancel.send(true);
+    Ok(())
 }
 
 #[tauri::command]
 async fn agent_new_conversation(state: State<'_, AppState>) -> Result<Vec<UiMessage>, String> {
     let mut session = state.session.lock().await;
     session.new_conversation();
+    Ok(session.ui_messages())
+}
+
+#[tauri::command]
+async fn agent_open_conversation(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<UiMessage>, String> {
+    let mut session = state.session.lock().await;
+    session.open_conversation(&id)?;
     Ok(session.ui_messages())
 }
 
@@ -189,100 +240,129 @@ pub fn run() {
                 Err(err) => eprintln!("[supone] 救场失败: {err}"),
             }
             let session = Session::open(dir);
+            let (chat_cancel, _) = watch::channel(false);
+            let chat_cancel = Arc::new(chat_cancel);
             let mcp_stop = mcp::spawn(std::sync::Arc::clone(&shell), shell.settings.mcp_config());
-            let mode_now = shell.configured_mode();
-            let rule = CheckMenuItem::with_id(
-                app,
-                "mode-rule",
-                "规则",
-                true,
-                mode_now == "rule",
-                None::<&str>,
-            )?;
-            let global = CheckMenuItem::with_id(
-                app,
-                "mode-global",
-                "全局",
-                true,
-                mode_now == "global",
-                None::<&str>,
-            )?;
-            let direct = CheckMenuItem::with_id(
-                app,
-                "mode-direct",
-                "直连",
-                true,
-                mode_now == "direct",
-                None::<&str>,
-            )?;
-            let mode =
-                Submenu::with_id_and_items(app, "mode", "模式", true, &[&rule, &global, &direct])?;
-            let show = MenuItem::with_id(app, "show", "打开窗口", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&mode, &show, &quit])?;
-            let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
-            app.manage(AppState {
-                shell,
-                session: tokio::sync::Mutex::new(session),
-                mcp_stop: std::sync::Mutex::new(mcp_stop),
-                tray_mode: TrayModeMenu {
-                    rule,
-                    global,
-                    direct,
-                },
-            });
-            TrayIconBuilder::with_id("main")
-                .tooltip("Supone Tunnel")
-                .icon(icon)
-                .menu(&menu)
-                .show_menu_on_left_click(true)
-                .on_tray_icon_event(|tray, event| {
-                    // 展开菜单前按覆盖里的真实模式刷新勾选（含 MCP / 对话改过的）。Author: kejiqing
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        sync_tray_mode(tray.app_handle());
-                    }
-                })
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "quit" => {
-                        let state = app.state::<AppState>();
-                        state.shell.shutdown_blocking();
-                        app.exit(0);
-                    }
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.unminimize();
-                            let _ = window.show();
-                            let _ = window.set_focus();
+
+            #[cfg(desktop)]
+            {
+                let mode_now = shell.configured_mode();
+                let rule = CheckMenuItem::with_id(
+                    app,
+                    "mode-rule",
+                    "规则",
+                    true,
+                    mode_now == "rule",
+                    None::<&str>,
+                )?;
+                let global = CheckMenuItem::with_id(
+                    app,
+                    "mode-global",
+                    "全局",
+                    true,
+                    mode_now == "global",
+                    None::<&str>,
+                )?;
+                let direct = CheckMenuItem::with_id(
+                    app,
+                    "mode-direct",
+                    "直连",
+                    true,
+                    mode_now == "direct",
+                    None::<&str>,
+                )?;
+                let mode = Submenu::with_id_and_items(
+                    app,
+                    "mode",
+                    "模式",
+                    true,
+                    &[&rule, &global, &direct],
+                )?;
+                let show = MenuItem::with_id(app, "show", "打开窗口", true, None::<&str>)?;
+                let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&mode, &show, &quit])?;
+                let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
+                app.manage(AppState {
+                    shell,
+                    session: tokio::sync::Mutex::new(session),
+                    chat_cancel,
+                    mcp_stop: std::sync::Mutex::new(mcp_stop),
+                    tray_mode: TrayModeMenu {
+                        rule,
+                        global,
+                        direct,
+                    },
+                });
+                TrayIconBuilder::with_id("main")
+                    .tooltip("Supone Tunnel")
+                    .icon(icon)
+                    .menu(&menu)
+                    .show_menu_on_left_click(true)
+                    .on_tray_icon_event(|tray, event| {
+                        // 展开菜单前按覆盖里的真实模式刷新勾选（含 MCP / 对话改过的）。Author: kejiqing
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            sync_tray_mode(tray.app_handle());
                         }
-                    }
-                    other => {
-                        let id = other.to_string();
-                        let app = app.clone();
-                        tauri::async_runtime::spawn(async move {
-                            if let Err(err) = tray_action(&app, &id).await {
-                                eprintln!("托盘操作失败: {err}");
+                    })
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "quit" => {
+                            let state = app.state::<AppState>();
+                            state.shell.shutdown_blocking();
+                            app.exit(0);
+                        }
+                        "show" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.unminimize();
+                                let _ = window.show();
+                                let _ = window.set_focus();
                             }
-                        });
-                    }
-                })
-                .build(app)?;
+                        }
+                        other => {
+                            let id = other.to_string();
+                            let app = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Err(err) = tray_action(&app, &id).await {
+                                    eprintln!("托盘操作失败: {err}");
+                                }
+                            });
+                        }
+                    })
+                    .build(app)?;
+            }
+
+            #[cfg(mobile)]
+            {
+                app.manage(AppState {
+                    shell,
+                    session: tokio::sync::Mutex::new(session),
+                    chat_cancel,
+                    mcp_stop: std::sync::Mutex::new(mcp_stop),
+                });
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
+            #[cfg(desktop)]
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+            }
+            #[cfg(mobile)]
+            {
+                let _ = (window, event);
             }
         })
         .invoke_handler(tauri::generate_handler![
             runtime_status,
             runtime_start,
             runtime_stop,
+            runtime_traffic,
             runtime_set_mode,
             runtime_set_tun,
             runtime_set_system_proxy,
@@ -294,31 +374,34 @@ pub fn run() {
             profile_activate,
             profile_read_override,
             profile_write_override,
+            profile_reset_override,
             agent_history,
+            agent_list_conversations,
             agent_send,
+            agent_cancel,
             agent_new_conversation,
+            agent_open_conversation,
             settings_get,
             settings_save,
             settings_download_mihomo
         ])
         .build(tauri::generate_context!())
         .expect("启动失败")
-        .run(|app, event| {
-            match event {
-                RunEvent::ExitRequested { .. } | RunEvent::Exit => {
-                    let state = app.state::<AppState>();
-                    if let Ok(mut guard) = state.mcp_stop.lock() {
-                        if let Some(tx) = guard.take() {
-                            let _ = tx.send(false);
-                        }
+        .run(|app, event| match event {
+            RunEvent::ExitRequested { .. } | RunEvent::Exit => {
+                let state = app.state::<AppState>();
+                if let Ok(mut guard) = state.mcp_stop.lock() {
+                    if let Some(tx) = guard.take() {
+                        let _ = tx.send(false);
                     }
-                    state.shell.shutdown_blocking();
                 }
-                _ => {}
+                state.shell.shutdown_blocking();
             }
+            _ => {}
         });
 }
 
+#[cfg(desktop)]
 async fn tray_action(app: &AppHandle, id: &str) -> Result<(), String> {
     let state = app.state::<AppState>();
     match id {
@@ -338,6 +421,7 @@ async fn tray_action(app: &AppHandle, id: &str) -> Result<(), String> {
 }
 
 /// 托盘「模式」三项互斥勾选，对齐 configured_mode。Author: kejiqing
+#[cfg(desktop)]
 fn sync_tray_mode(app: &AppHandle) {
     let state = app.state::<AppState>();
     let mode = state.shell.configured_mode();

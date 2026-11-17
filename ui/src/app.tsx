@@ -1,18 +1,27 @@
 import { useEffect, useRef, useState } from "react";
 import { renderMarkdown } from "./markdown";
-import type { AppSettings, Profile, ProxyGroup, SettingsView, Status, UiMessage } from "./api";
+import type {
+  AppSettings,
+  ConversationSummary,
+  Profile,
+  SettingsView,
+  Status,
+  UiMessage,
+} from "./api";
 import {
+  agentCancel,
   agentHistory,
+  agentListConversations,
   agentNewConversation,
+  agentOpenConversation,
   agentSend,
   profileActivate,
   profileImport,
   profileList,
   profileReadOverride,
   profileRefresh,
+  profileResetOverride,
   profileWriteOverride,
-  runtimeGroups,
-  runtimeSelect,
   runtimeSetMode,
   runtimeSetSystemProxy,
   runtimeSetTun,
@@ -26,6 +35,7 @@ import {
 import { MessageActions } from "./components/message-actions";
 import { ThinkingLoader } from "./components/thinking-loader";
 import { ToolCallCard } from "./components/tool-call-card";
+import { TrafficChart } from "./components/traffic-chart";
 
 type Tab = "status" | "profiles" | "override" | "chat" | "settings";
 
@@ -64,16 +74,13 @@ function TabButton(props: { id: Tab; tab: Tab; setTab: (tab: Tab) => void; label
 
 function StatusPane() {
   const [status, setStatus] = useState<Status | null>(null);
-  const [groups, setGroups] = useState<ProxyGroup[]>([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
   async function load() {
     setError("");
     try {
-      const next = await runtimeStatus();
-      setStatus(next);
-      setGroups(next.running ? await runtimeGroups() : []);
+      setStatus(await runtimeStatus());
     } catch (err) {
       setError(message(err));
     }
@@ -101,6 +108,7 @@ function StatusPane() {
     mode === "global" ? "全局" : mode === "direct" ? "直连" : "规则";
   return (
     <section className="panel">
+      <TrafficChart running={Boolean(status?.running)} />
       <div className="grid">
         <span>内核</span>
         <strong>{status?.running ? "运行中" : "已停止"}</strong>
@@ -135,14 +143,24 @@ function StatusPane() {
         <span>官方内核</span>
         <span className="url">{status?.mihomoBin || "未安装，请到设置下载"}</span>
         <span>对话</span>
-        <span>NeuroGate</span>
+        <span>{status?.agentReady ? "已配置" : "未配置"}</span>
       </div>
       <div className="actions">
-        <button className="primary" disabled={busy} onClick={() => void run(() => runtimeStart())}>
-          启动
-        </button>
-        <button disabled={busy} onClick={() => void run(() => runtimeStop())}>
-          停止
+        <button
+          type="button"
+          role="switch"
+          aria-checked={Boolean(status?.running)}
+          aria-label={status?.running ? "停止内核" : "启动内核"}
+          className={`power-switch${status?.running ? " is-on" : ""}`}
+          disabled={busy}
+          onClick={() =>
+            void run(() => (status?.running ? runtimeStop() : runtimeStart()))
+          }
+        >
+          <span className="power-switch__track" aria-hidden="true">
+            <span className="power-switch__thumb" />
+          </span>
+          <span className="power-switch__text">{status?.running ? "运行中" : "已停止"}</span>
         </button>
         <button disabled={busy || mode === "rule"} onClick={() => void run(() => runtimeSetMode("rule"))}>
           规则
@@ -169,25 +187,6 @@ function StatusPane() {
           刷新
         </button>
       </div>
-      {groups.map((group) => (
-        <label className="group" key={group.name}>
-          <span>{group.name}</span>
-          <select
-            value={group.now}
-            disabled={busy}
-            onChange={(event) => {
-              const name = event.currentTarget.value;
-              void run(() => runtimeSelect(group.name, name));
-            }}
-          >
-            {group.all.map((name) => (
-              <option key={name} value={name}>
-                {name}
-              </option>
-            ))}
-          </select>
-        </label>
-      ))}
       {error && <p className="error">{error}</p>}
     </section>
   );
@@ -273,6 +272,19 @@ function ProfilePane() {
             <button disabled={busy} onClick={() => void run(() => profileRefresh(profile.id))}>
               刷新
             </button>
+            {profile.active && (
+              <button
+                disabled={busy}
+                onClick={() => {
+                  if (!window.confirm("清空本地覆盖，回到仅订阅原文？规则/DNS/TUN 排除等本地改动会丢失。")) {
+                    return;
+                  }
+                  void run(() => profileResetOverride(profile.id));
+                }}
+              >
+                恢复初始
+              </button>
+            )}
           </div>
         </div>
       ))}
@@ -284,12 +296,17 @@ function ProfilePane() {
 function OverridePane() {
   const [yaml, setYaml] = useState("");
   const [error, setError] = useState("");
+  const [hint, setHint] = useState("");
   const [busy, setBusy] = useState(false);
 
-  useEffect(() => {
-    profileReadOverride()
+  function reload() {
+    return profileReadOverride()
       .then(setYaml)
       .catch((err) => setError(message(err)));
+  }
+
+  useEffect(() => {
+    void reload();
   }, []);
 
   return (
@@ -303,14 +320,37 @@ function OverridePane() {
           onClick={() => {
             setBusy(true);
             setError("");
+            setHint("");
             profileWriteOverride(yaml)
+              .then(() => setHint("已保存"))
               .catch((err) => setError(message(err)))
               .finally(() => setBusy(false));
           }}
         >
           保存
         </button>
+        <button
+          disabled={busy}
+          onClick={() => {
+            if (!window.confirm("清空本地覆盖，回到仅订阅原文？规则/DNS/TUN 排除等本地改动会丢失。")) {
+              return;
+            }
+            setBusy(true);
+            setError("");
+            setHint("");
+            profileResetOverride()
+              .then(async (text) => {
+                setHint(text);
+                await reload();
+              })
+              .catch((err) => setError(message(err)))
+              .finally(() => setBusy(false));
+          }}
+        >
+          清空覆盖（恢复初始）
+        </button>
       </div>
+      {hint && <p className="muted">{hint}</p>}
       {error && <p className="error">{error}</p>}
     </section>
   );
@@ -318,14 +358,27 @@ function OverridePane() {
 
 function ChatPane() {
   const [messages, setMessages] = useState<UiMessage[]>([]);
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [text, setText] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [sending, setSending] = useState(false);
   const thread = useRef<HTMLDivElement>(null);
 
+  async function refreshConversations() {
+    try {
+      setConversations(await agentListConversations());
+    } catch (err) {
+      setError(message(err));
+    }
+  }
+
   useEffect(() => {
-    agentHistory()
-      .then(setMessages)
+    Promise.all([agentHistory(), agentListConversations()])
+      .then(([history, list]) => {
+        setMessages(history);
+        setConversations(list);
+      })
       .catch((err) => setError(message(err)));
   }, []);
 
@@ -334,42 +387,81 @@ function ChatPane() {
     if (node) {
       node.scrollTop = node.scrollHeight;
     }
-  }, [messages, busy]);
+  }, [messages, sending]);
+
+  const active = conversations.find((item) => item.active);
+  const activeId = active?.id ?? "";
+  const locked = busy || sending;
 
   function send() {
     const content = text.trim();
-    if (busy || content === "") {
+    if (locked || content === "") {
       return;
     }
     setBusy(true);
+    setSending(true);
     setError("");
     setMessages((prev) => [...prev, { role: "user", text: content }]);
     setText("");
     agentSend(content)
-      .then((next) => {
+      .then(async (next) => {
         setMessages(next);
+        await refreshConversations();
       })
       .catch(async (err) => {
-        setError(message(err));
+        const errText = message(err);
+        if (errText.includes("已取消")) {
+          setError("");
+        } else {
+          setError(errText);
+        }
         try {
           setMessages(await agentHistory());
+          await refreshConversations();
         } catch {
           // 历史记录读取失败时保留当前对话。
         }
       })
-      .finally(() => setBusy(false));
+      .finally(() => {
+        setSending(false);
+        setBusy(false);
+      });
+  }
+
+  function cancel() {
+    if (!sending) {
+      return;
+    }
+    agentCancel().catch((err) => setError(message(err)));
   }
 
   function startNew() {
-    if (busy) {
+    if (locked) {
       return;
     }
     setBusy(true);
     setError("");
     agentNewConversation()
-      .then((next) => {
+      .then(async (next) => {
         setMessages(next);
         setText("");
+        await refreshConversations();
+      })
+      .catch((err) => setError(message(err)))
+      .finally(() => setBusy(false));
+  }
+
+  function openConversation(id: string) {
+    if (locked || !id || id === activeId) {
+      return;
+    }
+    setBusy(true);
+    setError("");
+    agentOpenConversation(id)
+      .then(async (next) => {
+        setMessages(next);
+        setText("");
+        await refreshConversations();
       })
       .catch((err) => setError(message(err)))
       .finally(() => setBusy(false));
@@ -378,19 +470,37 @@ function ChatPane() {
   return (
     <section className="panel chat-panel">
       <div className="chat-bar">
-        <strong>对话</strong>
-        <button type="button" className="ghost" disabled={busy} onClick={startNew}>
+        <div className="chat-bar-left">
+          <strong>对话</strong>
+          <label className="chat-history">
+            <span className="sr-only">对话历史</span>
+            <select
+              value={activeId}
+              disabled={locked || conversations.length === 0}
+              onChange={(event) => openConversation(event.currentTarget.value)}
+            >
+              {conversations.length === 0 && <option value="">新对话</option>}
+              {conversations.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.title}
+                  {item.updatedAt ? ` · ${item.updatedAt}` : ""}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <button type="button" className="ghost" disabled={locked} onClick={startNew}>
           新对话
         </button>
       </div>
       <div className="chat" ref={thread}>
-        {messages.length === 0 && !busy && (
-          <p className="chat-empty">直接说要改的出口、规则或 DNS。</p>
+        {messages.length === 0 && !sending && (
+          <p className="chat-empty">直接说要改的出口、规则或 DNS。设置里可配 DeepSeek SK 或 NeuroGate。</p>
         )}
         {messages.map((item, index) => (
           <ChatMessage item={item} key={`${item.role}-${index}`} />
         ))}
-        {busy && (
+        {sending && (
           <div className="chat-thinking">
             <ThinkingLoader
               phases={["处理中", "调用工具", "整理结果"]}
@@ -404,6 +514,9 @@ function ChatPane() {
         className="composer"
         onSubmit={(event) => {
           event.preventDefault();
+          if (locked) {
+            return;
+          }
           send();
         }}
       >
@@ -412,7 +525,7 @@ function ChatPane() {
           rows={1}
           placeholder="Enter 发送，Shift+Enter 换行"
           value={text}
-          disabled={busy}
+          disabled={locked}
           onInput={(event) => setText(event.currentTarget.value)}
           onKeyDown={(event) => {
             if (event.key !== "Enter" || event.shiftKey) {
@@ -425,12 +538,21 @@ function ChatPane() {
             if (event.nativeEvent.isComposing || event.keyCode === 229) {
               return;
             }
+            if (locked) {
+              return;
+            }
             send();
           }}
         />
-        <button className="primary" type="submit" disabled={busy || text.trim() === ""}>
-          {busy ? "…" : "发送"}
-        </button>
+        {sending ? (
+          <button className="danger" type="button" onClick={cancel}>
+            停止
+          </button>
+        ) : (
+          <button className="primary" type="submit" disabled={locked || text.trim() === ""}>
+            发送
+          </button>
+        )}
       </form>
       {error && <p className="error chat-error">{error}</p>}
     </section>
@@ -525,8 +647,34 @@ function SettingsPane() {
 
   return (
     <section className="panel">
-      <p className="muted">对话固定走 NeuroGate。这里只改内核路径和本机 MCP。</p>
+      <p className="muted">
+        对话：key 以 ngmk_ 开头走 NeuroGate；否则走 OpenAI 兼容 API（如 DeepSeek）。外部 agent（PI）挂本机 MCP。
+      </p>
       <div className="grid settings-grid">
+        <label htmlFor="agent-base">对话 Base URL</label>
+        <input
+          id="agent-base"
+          type="text"
+          placeholder="https://api.deepseek.com 或 NeuroGate 地址"
+          value={form.agentBaseUrl}
+          onInput={(event) => setForm({ ...form, agentBaseUrl: event.currentTarget.value })}
+        />
+        <label htmlFor="agent-key">对话 API Key</label>
+        <input
+          id="agent-key"
+          type="password"
+          placeholder="sk-… 或 ngmk_…"
+          value={form.agentApiKey}
+          onInput={(event) => setForm({ ...form, agentApiKey: event.currentTarget.value })}
+        />
+        <label htmlFor="agent-model">对话模型</label>
+        <input
+          id="agent-model"
+          type="text"
+          placeholder="deepseek-chat"
+          value={form.agentModel}
+          onInput={(event) => setForm({ ...form, agentModel: event.currentTarget.value })}
+        />
         <label htmlFor="mihomo-bin">内核路径</label>
         <input
           id="mihomo-bin"
@@ -535,7 +683,7 @@ function SettingsPane() {
           value={form.mihomoBin}
           onInput={(event) => setForm({ ...form, mihomoBin: event.currentTarget.value })}
         />
-        <label htmlFor="mcp-enabled">MCP（NeuroGate）</label>
+        <label htmlFor="mcp-enabled">本机 MCP</label>
         <label className="check">
           <input
             id="mcp-enabled"
@@ -543,7 +691,7 @@ function SettingsPane() {
             checked={form.mcpEnabled}
             onChange={(event) => setForm({ ...form, mcpEnabled: event.currentTarget.checked })}
           />
-          启用 HTTP + Token
+          启用 HTTP + Token（给 PI / NeuroGate 挂载）
         </label>
         <label htmlFor="mcp-bind">MCP 监听</label>
         <input
@@ -557,7 +705,7 @@ function SettingsPane() {
         <input
           id="mcp-token"
           type="password"
-          placeholder="Bearer token，给 NeuroGate inject"
+          placeholder="Bearer token"
           value={form.mcpToken}
           onInput={(event) => setForm({ ...form, mcpToken: event.currentTarget.value })}
         />

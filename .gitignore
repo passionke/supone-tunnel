@@ -5,3 +5,9 @@ src-tauri/target/
 src-tauri/gen/
 .DS_Store
 .cargo/config.toml
+attic/android-kotlin-shell/.gradle/
+attic/android-kotlin-shell/local.properties
+attic/android-kotlin-shell/app/build/
+attic/android-kotlin-shell/build/
+attic/android-kotlin-shell/app/src/main/assets/mihomo-android-amd64
+attic/android-kotlin-shell/app/src/main/assets/subscription.sample.yaml

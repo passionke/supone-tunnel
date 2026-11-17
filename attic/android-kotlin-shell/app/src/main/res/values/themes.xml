@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Author: kejiqing -->
+<resources>
+    <style name="Theme.SuponeTunnel" parent="Theme.MaterialComponents.DayNight.DarkActionBar">
+        <item name="colorPrimary">#1B4D3E</item>
+        <item name="colorPrimaryVariant">#0F2E25</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+        <item name="colorSecondary">#C4A35A</item>
+        <item name="android:statusBarColor">#0F2E25</item>
+    </style>
+</resources>

@@ -4,27 +4,110 @@
 use std::process::Command;
 
 pub fn set_enabled(enable: bool, port: u16) -> Result<(), String> {
-    if cfg!(target_os = "macos") {
-        macos_set(enable, port)
-    } else if cfg!(target_os = "windows") {
-        windows_set(enable, port)
-    } else if cfg!(target_os = "linux") {
-        gnome_set(enable, port)
-    } else {
+    #[cfg(target_os = "macos")]
+    {
+        return macos_set(enable, port);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return windows_set(enable, port);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return gnome_set(enable, port);
+    }
+    #[cfg(target_os = "android")]
+    {
+        return android_set(enable, port);
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "linux",
+        target_os = "android"
+    )))]
+    {
+        let _ = (enable, port);
         Err("当前系统不支持系统代理".into())
     }
 }
 
 pub fn is_enabled() -> Result<bool, String> {
-    if cfg!(target_os = "macos") {
-        macos_enabled()
-    } else if cfg!(target_os = "windows") {
-        windows_enabled()
-    } else if cfg!(target_os = "linux") {
-        gnome_enabled()
-    } else {
+    #[cfg(target_os = "macos")]
+    {
+        return macos_enabled();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return windows_enabled();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return gnome_enabled();
+    }
+    #[cfg(target_os = "android")]
+    {
+        return android_enabled();
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "linux",
+        target_os = "android"
+    )))]
+    {
         Err("当前系统不支持系统代理".into())
     }
+}
+
+/// Android：写全局 http_proxy（需 WRITE_SECURE_SETTINGS 或 root su）。
+/// 本期不做 VpnService；Chrome 可能不认该设置。Author: kejiqing
+#[cfg(target_os = "android")]
+fn android_set(enable: bool, port: u16) -> Result<(), String> {
+    let value = if enable {
+        format!("127.0.0.1:{port}")
+    } else {
+        ":0".into()
+    };
+    // 不用 su：避免启动时弹 Superuser；部署侧 pm grant WRITE_SECURE_SETTINGS。
+    android_settings_put(&value).map_err(|err| {
+        format!("{err}；请 adb shell pm grant <pkg> android.permission.WRITE_SECURE_SETTINGS")
+    })
+}
+
+#[cfg(target_os = "android")]
+fn android_enabled() -> Result<bool, String> {
+    let output = Command::new("settings")
+        .args(["get", "global", "http_proxy"])
+        .output()
+        .map_err(|_| "无法读 Android 系统代理".to_string())?;
+    // 无 WRITE_SECURE_SETTINGS 时 settings 会吐 UserManager 异常；当作未开启，不刷屏。
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    if text.contains("Security exception") || text.contains("Exception") {
+        return Ok(false);
+    }
+    Ok(parse_android_http_proxy(&text))
+}
+
+#[cfg(target_os = "android")]
+fn android_settings_put(value: &str) -> Result<(), String> {
+    let output = Command::new("settings")
+        .args(["put", "global", "http_proxy", value])
+        .output()
+        .map_err(|err| format!("无法写 Android 系统代理: {err}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_error(&output))
+    }
+}
+
+pub(crate) fn parse_android_http_proxy(text: &str) -> bool {
+    let t = text.trim();
+    !t.is_empty() && t != "null" && t != ":0" && t.contains("127.0.0.1")
 }
 
 fn macos_set(enable: bool, port: u16) -> Result<(), String> {
@@ -298,5 +381,8 @@ mod tests {
         assert_eq!(parse_gnome_mode("'manual'"), Some(true));
         assert_eq!(parse_gnome_mode("'none'"), Some(false));
         assert_eq!(parse_gnome_mode("'auto'"), None);
+        assert!(parse_android_http_proxy("127.0.0.1:7890\n"));
+        assert!(!parse_android_http_proxy(":0"));
+        assert!(!parse_android_http_proxy("null"));
     }
 }

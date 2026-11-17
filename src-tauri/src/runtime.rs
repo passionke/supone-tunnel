@@ -32,6 +32,16 @@ pub struct DelaySample {
     pub delay_ms: Option<u32>,
 }
 
+/// mihomo `/traffic` 瞬时上下行（字节/秒）。
+/// Author: kejiqing
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrafficSample {
+    pub up: u64,
+    pub down: u64,
+    pub running: bool,
+}
+
 /// mihomo `/connections` 一条连接的运行时证据（不是规则推理）。
 /// Author: kejiqing
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +63,29 @@ pub struct ConnEvidence {
 /// Author: kejiqing
 pub const DELAY_TEST_URL: &str = "https://www.gstatic.com/generate_204";
 pub const DELAY_TIMEOUT_MS: u64 = 5000;
+
+/// 带宽测速下载上限（字节）。到此即停，不追求下完整文件。
+/// Author: kejiqing
+pub const BANDWIDTH_MAX_BYTES: u64 = 12 * 1024 * 1024;
+/// 带宽测速默认/最大超时（毫秒）。
+pub const BANDWIDTH_DEFAULT_TIMEOUT_MS: u64 = 12_000;
+pub const BANDWIDTH_MAX_TIMEOUT_MS: u64 = 30_000;
+
+/// 稳定性采样默认次数与间隔。
+pub const STABILITY_DEFAULT_SAMPLES: u32 = 5;
+pub const STABILITY_MAX_SAMPLES: u32 = 20;
+pub const STABILITY_DEFAULT_INTERVAL_MS: u64 = 400;
+pub const STABILITY_MAX_INTERVAL_MS: u64 = 5_000;
+
+/// 带宽测速 URL：`REGION=china` 用国内镜像大文件，否则 Cloudflare 可控字节下载。
+/// Author: kejiqing
+pub fn bandwidth_test_url() -> &'static str {
+    if std::env::var("REGION").ok().as_deref() == Some("china") {
+        "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/24.04/ubuntu-24.04.1-desktop-amd64.iso"
+    } else {
+        "https://speed.cloudflare.com/__down?bytes=25000000"
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -171,6 +204,9 @@ impl Runtime {
         let bin = self.resolve_bin()?;
         let work = self.profiles.root();
         let want_tun = self.profiles.tun_enabled_effective();
+        if want_tun && (cfg!(windows) || cfg!(target_os = "android")) {
+            return Err("当前平台本期不支持 TUN，请用系统代理（set_system_proxy）".into());
+        }
         if want_tun {
             // macOS 创建 utun 要 root；一次性 setuid mihomo + 停内核 helper。
             privkill::ensure_tun_privilege(&bin, &work)?;
@@ -218,7 +254,7 @@ impl Runtime {
             "内核未报告 TUN 错误，但运行时 tun.enable 仍为关".into()
         });
         Err(format!(
-            "TUN 未能开启。{detail}。macOS 需管理员权限创建虚拟网卡；请在密码框允许后重试（界面或对话均可）。"
+            "TUN 未能开启。{detail}。macOS 需管理员权限创建虚拟网卡；Windows 本期请关 TUN、改用系统代理。"
         ))
     }
 
@@ -257,9 +293,7 @@ impl Runtime {
         pids.sort_unstable();
         pids.dedup();
         for pid in &pids {
-            let _ = Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .status();
+            privkill::force_kill_pid(*pid);
         }
         if port_open(port) || pids.iter().any(|pid| process_alive(*pid)) {
             // 给套接字一点时间关掉，避免杀成功了还弹管理员框。
@@ -631,6 +665,55 @@ impl Runtime {
         Ok(format!("连接 {} 条（最多 40）\n{}", lines.len(), lines.join("\n")))
     }
 
+    /// 采一帧 `/traffic`（流式接口取首行）。未运行时返回 0。
+    /// Author: kejiqing
+    pub async fn traffic_sample(&self) -> Result<TrafficSample, String> {
+        if !self.running() {
+            return Ok(TrafficSample {
+                up: 0,
+                down: 0,
+                running: false,
+            });
+        }
+        use futures_util::StreamExt;
+        // mihomo `/traffic` 首帧在 ticker 约 1s 后才推；超时需盖过首帧。Author: kejiqing
+        let response = self
+            .request(reqwest::Method::GET, "/traffic")
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|err| format!("读取流量失败: {err}"))?;
+        if !response.status().is_success() {
+            return Err(format!("读取流量失败: HTTP {}", response.status()));
+        }
+        let mut stream = response.bytes_stream();
+        let mut buf = String::new();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline {
+            let next = tokio::time::timeout(Duration::from_millis(2500), stream.next()).await;
+            match next {
+                Ok(Some(Ok(chunk))) => {
+                    buf.push_str(&String::from_utf8_lossy(&chunk));
+                    if let Some(line) = buf.lines().find(|item| !item.trim().is_empty()) {
+                        let value: serde_json::Value = serde_json::from_str(line.trim())
+                            .map_err(|err| format!("流量解析失败: {err}"))?;
+                        let up = json_u64(&value, "up");
+                        let down = json_u64(&value, "down");
+                        return Ok(TrafficSample {
+                            up,
+                            down,
+                            running: true,
+                        });
+                    }
+                }
+                Ok(Some(Err(err))) => return Err(format!("读取流量失败: {err}")),
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        Err("读取流量超时".into())
+    }
+
     /// 读取 `/connections` 运行时证据。可按 host 子串过滤（大小写不敏感）。
     /// Author: kejiqing
     pub async fn connection_evidence(
@@ -772,6 +855,17 @@ impl TunView {
     }
 }
 
+fn json_u64(value: &serde_json::Value, key: &str) -> u64 {
+    value
+        .get(key)
+        .and_then(|item| {
+            item.as_u64()
+                .or_else(|| item.as_i64().and_then(|n| u64::try_from(n).ok()))
+                .or_else(|| item.as_f64().map(|n| n.max(0.0) as u64))
+        })
+        .unwrap_or(0)
+}
+
 fn json_string_list(value: Option<&serde_json::Value>) -> String {
     value
         .and_then(|value| value.as_array())
@@ -816,16 +910,33 @@ fn port_open(port: u16) -> bool {
 }
 
 fn process_alive(pid: u32) -> bool {
-    // setuid root 的内核：普通用户 `kill -0` 常返回 EPERM，不能当成已死。
-    if Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    #[cfg(windows)]
     {
-        return true;
+        let Ok(output) = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+        else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        return text.contains(&pid.to_string());
     }
-    !process_command(pid).is_empty()
+    #[cfg(not(windows))]
+    {
+        // setuid root 的内核：普通用户 `kill -0` 常返回 EPERM，不能当成已死。
+        if Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        !process_command(pid).is_empty()
+    }
 }
 
 fn last_tun_error(log_path: &Path) -> Option<String> {
@@ -1127,6 +1238,20 @@ mod tests {
         assert_eq!(row.name, "香港-01");
         assert_eq!(row.delay_ms, Some(42));
         assert!(parse_proxy_delay("x", &json!({"message": "no"})).is_err());
+    }
+
+    #[test]
+    fn bandwidth_url_switches_on_region() {
+        // 不依赖进程环境是否已设 REGION：分别断言两路常量语义。
+        let china = "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-releases/24.04/ubuntu-24.04.1-desktop-amd64.iso";
+        let intl = "https://speed.cloudflare.com/__down?bytes=25000000";
+        let url = super::bandwidth_test_url();
+        assert!(url == china || url == intl, "{url}");
+        if std::env::var("REGION").ok().as_deref() == Some("china") {
+            assert_eq!(url, china);
+        } else {
+            assert_eq!(url, intl);
+        }
     }
 
     #[test]

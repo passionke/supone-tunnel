@@ -47,9 +47,23 @@ export type ProxyGroup = {
   all: string[];
 };
 
+/** mihomo `/traffic` 瞬时上下行（字节/秒）。Author: kejiqing */
+export type TrafficSample = {
+  up: number;
+  down: number;
+  running: boolean;
+};
+
 export type UiMessage = {
   role: "user" | "assistant" | "tool";
   text: string;
+};
+
+export type ConversationSummary = {
+  id: string;
+  title: string;
+  updatedAt: string;
+  active: boolean;
 };
 
 export function runtimeStatus(): Promise<Status> {
@@ -62,6 +76,10 @@ export function runtimeStart(): Promise<Status> {
 
 export function runtimeStop(): Promise<void> {
   return invoke("runtime_stop");
+}
+
+export function runtimeTraffic(): Promise<TrafficSample> {
+  return invoke("runtime_traffic");
 }
 
 export function runtimeSetMode(mode: string): Promise<string> {
@@ -100,6 +118,10 @@ export function profileWriteOverride(yaml: string): Promise<void> {
   return invoke("profile_write_override", { yaml });
 }
 
+export function profileResetOverride(id?: string | null): Promise<string> {
+  return invoke("profile_reset_override", { id: id ?? null });
+}
+
 export function runtimeSetTun(enable: boolean): Promise<Status> {
   return invoke("runtime_set_tun", { enable });
 }
@@ -112,12 +134,24 @@ export function agentHistory(): Promise<UiMessage[]> {
   return invoke("agent_history");
 }
 
+export function agentListConversations(): Promise<ConversationSummary[]> {
+  return invoke("agent_list_conversations");
+}
+
 export function agentSend(text: string): Promise<UiMessage[]> {
   return invoke("agent_send", { text });
 }
 
+export function agentCancel(): Promise<void> {
+  return invoke("agent_cancel");
+}
+
 export function agentNewConversation(): Promise<UiMessage[]> {
   return invoke("agent_new_conversation");
+}
+
+export function agentOpenConversation(id: string): Promise<UiMessage[]> {
+  return invoke("agent_open_conversation", { id });
 }
 
 export function settingsGet(): Promise<SettingsView> {

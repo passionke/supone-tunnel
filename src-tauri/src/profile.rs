@@ -288,6 +288,26 @@ impl ProfileStore {
         self.rebuild_effective(&id, port, &secret)
     }
 
+    /// 清空本地覆盖，回到仅订阅原文（+ 壳锁字段）。不改 remote。
+    /// `id` 空则用当前激活订阅。Author: kejiqing
+    pub fn reset_override(&self, id: Option<&str>) -> Result<ProfileMeta, String> {
+        let id = match id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => id.to_string(),
+            None => self.require_active()?,
+        };
+        let (port, secret) = {
+            let guard = self.lock();
+            let dir = profile_dir(&guard.root, &id);
+            if !dir.join("meta.json").is_file() {
+                return Err(format!("订阅不存在: {id}"));
+            }
+            write_private(&dir.join("override.yaml"), b"{}\n")?;
+            (guard.state.controller_port, guard.state.secret.clone())
+        };
+        self.rebuild_effective(&id, port, &secret)?;
+        self.meta_of(&id)
+    }
+
     pub fn patch_override(&self, patch: Value) -> Result<(), String> {
         let id = self.require_active()?;
         let (port, secret, mut doc) = {
@@ -415,8 +435,180 @@ impl ProfileStore {
         ensure_proxy_server_route_excludes(&mut doc);
         // rule-prepend 只存在于覆盖里，拼到订阅规则前面，再从生效配置里拿掉。
         apply_rule_prepend(&mut doc);
+        // proxy-group-upsert 按 name 合并进 proxy-groups，再删掉该键（mihomo 不认）。
+        apply_proxy_group_upsert(&mut doc);
         let text = serde_yaml::to_string(&doc).map_err(|err| err.to_string())?;
         write_private(&dir.join("effective.yaml"), text.as_bytes())
+    }
+
+    /// 新建或按名覆盖一个本地代理组（写入 override，刷新订阅不冲掉）。
+    /// 返回 `(created, 组摘要)`：created=true 表示此前生效配置里没有同名组。
+    /// Author: kejiqing
+    pub fn upsert_proxy_group(
+        &self,
+        name: &str,
+        group_type: &str,
+        proxies: &[String],
+        url: Option<&str>,
+        interval: Option<u64>,
+    ) -> Result<(bool, String), String> {
+        let name = normalize_group_name(name)?;
+        let group_type = normalize_group_type(group_type)?;
+        let proxies = normalize_group_proxies(proxies)?;
+        let url = url.map(str::trim).filter(|v| !v.is_empty());
+        if matches!(group_type.as_str(), "url-test" | "fallback" | "load-balance") {
+            if let Some(raw) = url {
+                normalize_http_url_field(raw)?;
+            }
+        } else if url.is_some() {
+            return Err("只有 url-test / fallback / load-balance 才需要 url".into());
+        }
+        if let Some(sec) = interval {
+            if !(1..=86_400).contains(&sec) {
+                return Err("interval 须在 1..=86400 秒".into());
+            }
+            if group_type == "select" {
+                return Err("select 组不要传 interval".into());
+            }
+        }
+
+        let known = self.known_proxy_names()?;
+        for member in &proxies {
+            if member == &name {
+                return Err("组成员不能指向自己".into());
+            }
+            if !known.contains(member) {
+                return Err(format!(
+                    "未知成员 {member}；须是叶子节点、已有代理组或 DIRECT/REJECT 等内置策略"
+                ));
+            }
+        }
+
+        let created = !self
+            .effective_proxy_group_names()
+            .iter()
+            .any(|item| item == &name);
+
+        let mut entry = serde_yaml::Mapping::new();
+        entry.insert(
+            Value::String("name".into()),
+            Value::String(name.clone()),
+        );
+        entry.insert(
+            Value::String("type".into()),
+            Value::String(group_type.clone()),
+        );
+        entry.insert(
+            Value::String("proxies".into()),
+            Value::Sequence(proxies.iter().cloned().map(Value::String).collect()),
+        );
+        if matches!(group_type.as_str(), "url-test" | "fallback" | "load-balance") {
+            let test_url = url
+                .unwrap_or("http://www.gstatic.com/generate_204")
+                .to_string();
+            entry.insert(Value::String("url".into()), Value::String(test_url));
+            let sec = interval.unwrap_or(300);
+            entry.insert(
+                Value::String("interval".into()),
+                Value::Number(sec.into()),
+            );
+        }
+
+        let mut list = self.proxy_group_upserts();
+        list.retain(|item| group_entry_name(item).as_deref() != Some(name.as_str()));
+        list.push(Value::Mapping(entry));
+        self.write_proxy_group_upserts(&list)?;
+
+        let summary = format!(
+            "{name} type={group_type} proxies={}",
+            proxies.join(", ")
+        );
+        Ok((created, summary))
+    }
+
+    pub fn proxy_group_upserts_text(&self) -> String {
+        let list = self.proxy_group_upserts();
+        if list.is_empty() {
+            return "本地代理组覆盖: 无".into();
+        }
+        let mut lines = vec![format!("本地代理组覆盖 {} 个:", list.len())];
+        for item in list {
+            let name = group_entry_name(&item).unwrap_or_else(|| "?".into());
+            let kind = mapping_get(&item, "type")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let proxies = mapping_get(&item, "proxies")
+                .and_then(Value::as_sequence)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            lines.push(format!("- {name} type={kind} proxies={proxies}"));
+        }
+        lines.join("\n")
+    }
+
+    fn proxy_group_upserts(&self) -> Vec<Value> {
+        self.read_override_value()
+            .and_then(|doc| mapping_get(&doc, "proxy-group-upsert").cloned())
+            .and_then(|value| value.as_sequence().cloned())
+            .unwrap_or_default()
+    }
+
+    fn write_proxy_group_upserts(&self, list: &[Value]) -> Result<(), String> {
+        self.patch_override(mapping_insert(
+            "proxy-group-upsert",
+            Value::Sequence(list.to_vec()),
+        ))
+    }
+
+    fn effective_proxy_group_names(&self) -> Vec<String> {
+        self.read_effective_value()
+            .and_then(|doc| mapping_get(&doc, "proxy-groups").cloned())
+            .and_then(|value| value.as_sequence().cloned())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(group_entry_name)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 叶子节点 + 生效代理组 + 内置策略，供组成员校验。
+    fn known_proxy_names(&self) -> Result<std::collections::BTreeSet<String>, String> {
+        let doc = self
+            .read_effective_value()
+            .ok_or_else(|| "没有生效配置".to_string())?;
+        let mut names = std::collections::BTreeSet::new();
+        for builtin in ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"] {
+            names.insert(builtin.into());
+        }
+        if let Some(Value::Sequence(proxies)) = mapping_get(&doc, "proxies") {
+            for item in proxies {
+                if let Some(name) = mapping_get(item, "name").and_then(Value::as_str) {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+        if let Some(Value::Sequence(groups)) = mapping_get(&doc, "proxy-groups") {
+            for item in groups {
+                if let Some(name) = group_entry_name(item) {
+                    names.insert(name);
+                }
+            }
+        }
+        // 尚未 rebuild 进 effective 的本地 upsert 也算已知组，便于互相引用。
+        for item in self.proxy_group_upserts() {
+            if let Some(name) = group_entry_name(&item) {
+                names.insert(name);
+            }
+        }
+        Ok(names)
     }
 
     /// 在订阅规则最前插入一条（刷新订阅不会冲掉）。Author: kejiqing
@@ -651,7 +843,7 @@ fn lock_geox(map: &mut serde_yaml::Mapping) {
     geox.insert(Value::String("asn".into()), Value::String(NORA_ASN.into()));
 }
 
-/// 默认走 TUN 虚拟网卡。覆盖里写明 tun.enable: false 时才关掉。
+/// 默认走 TUN 虚拟网卡（Windows/Android 默认关，走系统代理）。覆盖里写明 tun.enable: false 时才关掉。
 ///
 /// 两层防环，职责分开：
 /// - **拨号层**（本函数）：auto-detect-interface + gvisor + strict-route=false，
@@ -673,7 +865,9 @@ fn lock_tun(doc: &mut Value, override_text: &str) {
     let Some(Value::Mapping(tun)) = map.get_mut(&key) else {
         return;
     };
-    tun.insert(Value::String("enable".into()), Value::Bool(true));
+    // Windows/Android 本期无 VpnService/wintun，默认关 TUN；macOS/Linux 默认开。
+    let enable = !cfg!(windows) && !cfg!(target_os = "android");
+    tun.insert(Value::String("enable".into()), Value::Bool(enable));
     tun.insert(Value::String("auto-route".into()), Value::Bool(true));
     tun.insert(
         Value::String("auto-detect-interface".into()),
@@ -834,6 +1028,122 @@ fn apply_rule_prepend(doc: &mut Value) {
         }
     }
     map.insert(rules_key, Value::Sequence(merged));
+}
+
+/// 覆盖里的 `proxy-group-upsert` 按 name 合并进 proxy-groups，并从文档删除该键。
+/// Author: kejiqing
+fn apply_proxy_group_upsert(doc: &mut Value) {
+    let Value::Mapping(map) = doc else {
+        return;
+    };
+    let key = Value::String("proxy-group-upsert".into());
+    let Some(raw) = map.remove(&key) else {
+        return;
+    };
+    let Some(extra) = raw.as_sequence() else {
+        return;
+    };
+    let mut upserts = Vec::new();
+    for item in extra {
+        if !matches!(item, Value::Mapping(_)) {
+            continue;
+        }
+        if group_entry_name(item).is_none() {
+            continue;
+        }
+        upserts.push(item.clone());
+    }
+    if upserts.is_empty() {
+        return;
+    }
+    let groups_key = Value::String("proxy-groups".into());
+    let mut merged: Vec<Value> = match map.get(&groups_key) {
+        Some(Value::Sequence(existing)) => existing.clone(),
+        _ => Vec::new(),
+    };
+    for upsert in upserts {
+        let Some(name) = group_entry_name(&upsert) else {
+            continue;
+        };
+        if let Some(idx) = merged
+            .iter()
+            .position(|item| group_entry_name(item).as_deref() == Some(name.as_str()))
+        {
+            merged[idx] = upsert;
+        } else {
+            merged.push(upsert);
+        }
+    }
+    map.insert(groups_key, Value::Sequence(merged));
+}
+
+fn group_entry_name(item: &Value) -> Option<String> {
+    mapping_get(item, "name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+fn normalize_group_name(raw: &str) -> Result<String, String> {
+    let name = raw.trim();
+    if name.is_empty() || name.contains('\n') || name.chars().count() > 64 {
+        return Err("代理组名无效".into());
+    }
+    if name.contains(',') {
+        return Err("代理组名不能含逗号".into());
+    }
+    const RESERVED: &[&str] = &["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"];
+    if RESERVED.iter().any(|item| item.eq_ignore_ascii_case(name)) {
+        return Err(format!("不能使用内置策略名 {name}"));
+    }
+    Ok(name.to_string())
+}
+
+fn normalize_group_type(raw: &str) -> Result<String, String> {
+    let kind = raw.trim().to_ascii_lowercase();
+    match kind.as_str() {
+        "select" | "url-test" | "fallback" | "load-balance" => Ok(kind),
+        "" => Ok("select".into()),
+        other => Err(format!(
+            "不支持的代理组类型 {other}；可选 select / url-test / fallback / load-balance"
+        )),
+    }
+}
+
+fn normalize_group_proxies(raw: &[String]) -> Result<Vec<String>, String> {
+    if raw.is_empty() {
+        return Err("proxies 不能为空".into());
+    }
+    if raw.len() > 200 {
+        return Err("proxies 过多".into());
+    }
+    let mut out = Vec::new();
+    for item in raw {
+        let name = item.trim();
+        if name.is_empty() || name.contains('\n') || name.chars().count() > 64 {
+            return Err(format!("无效成员名: {item}"));
+        }
+        if out.iter().any(|have: &String| have == name) {
+            continue;
+        }
+        out.push(name.to_string());
+    }
+    if out.is_empty() {
+        return Err("proxies 不能为空".into());
+    }
+    Ok(out)
+}
+
+fn normalize_http_url_field(raw: &str) -> Result<(), String> {
+    let url = raw.trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("url 只支持 http 或 https".into());
+    }
+    if url.chars().any(|ch| ch.is_whitespace()) || url.chars().count() > 200 {
+        return Err("url 无效".into());
+    }
+    Ok(())
 }
 
 /// 接受 IPv4/IPv6 CIDR，或单 IP（补 /32、/128）。给 TUN route-exclude 用。
@@ -1182,6 +1492,25 @@ geox-url:
         let rules = mapping_get(&doc, "rules").unwrap().as_sequence().unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].as_str(), Some("B"));
+        store.reset_override(None).unwrap();
+        let override_text = fs::read_to_string(
+            tmp.0
+                .join("profiles")
+                .join(&meta.id)
+                .join("override.yaml"),
+        )
+        .unwrap();
+        assert_eq!(override_text.trim(), "{}");
+        let text = fs::read_to_string(
+            tmp.0
+                .join("profiles")
+                .join(&meta.id)
+                .join("effective.yaml"),
+        )
+        .unwrap();
+        let doc: Value = serde_yaml::from_str(&text).unwrap();
+        let rules = mapping_get(&doc, "rules").unwrap().as_sequence().unwrap();
+        assert_eq!(rules[0].as_str(), Some("A"));
         let tun = mapping_get(&doc, "tun").unwrap();
         assert_eq!(mapping_get(tun, "enable").unwrap().as_bool(), Some(true));
         assert_eq!(mapping_get(tun, "stack").unwrap().as_str(), Some("gvisor"));
@@ -1481,5 +1810,103 @@ geox-url:
             .as_sequence()
             .unwrap();
         assert!(excludes.is_empty());
+    }
+
+    #[test]
+    fn upsert_proxy_group_creates_and_edits_by_name() {
+        // 本地代理组写入 override，按名合并进生效 proxy-groups；刷新订阅不冲掉。
+        // Author: kejiqing
+        let tmp = Tmp::new();
+        let store = ProfileStore::open(tmp.0.clone()).unwrap();
+        store
+            .import_parsed(
+                "https://example.com/sub",
+                Some("示例".into()),
+                r#"
+proxies:
+  - name: sg
+    type: vless
+    server: 1.1.1.1
+    port: 1
+  - name: jp
+    type: vless
+    server: 1.0.0.1
+    port: 1
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - sg
+      - jp
+rules:
+  - MATCH,PROXY
+"#,
+            )
+            .unwrap();
+
+        let (created, _) = store
+            .upsert_proxy_group(
+                "CURSOR",
+                "select",
+                &["sg".into(), "DIRECT".into()],
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(created);
+
+        let text = fs::read_to_string(store.effective_file().unwrap()).unwrap();
+        assert!(!text.contains("proxy-group-upsert"));
+        let doc: Value = serde_yaml::from_str(&text).unwrap();
+        let groups = mapping_get(&doc, "proxy-groups")
+            .unwrap()
+            .as_sequence()
+            .unwrap();
+        assert_eq!(groups.len(), 2);
+        let cursor = groups
+            .iter()
+            .find(|item| group_entry_name(item).as_deref() == Some("CURSOR"))
+            .unwrap();
+        assert_eq!(
+            mapping_get(cursor, "type").and_then(Value::as_str),
+            Some("select")
+        );
+        let proxies = mapping_get(cursor, "proxies")
+            .unwrap()
+            .as_sequence()
+            .unwrap();
+        assert_eq!(proxies[0].as_str(), Some("sg"));
+        assert_eq!(proxies[1].as_str(), Some("DIRECT"));
+
+        let (created_again, _) = store
+            .upsert_proxy_group(
+                "PROXY",
+                "select",
+                &["jp".into(), "DIRECT".into()],
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(!created_again);
+        let text = fs::read_to_string(store.effective_file().unwrap()).unwrap();
+        let doc: Value = serde_yaml::from_str(&text).unwrap();
+        let groups = mapping_get(&doc, "proxy-groups")
+            .unwrap()
+            .as_sequence()
+            .unwrap();
+        let proxy = groups
+            .iter()
+            .find(|item| group_entry_name(item).as_deref() == Some("PROXY"))
+            .unwrap();
+        let proxies = mapping_get(proxy, "proxies")
+            .unwrap()
+            .as_sequence()
+            .unwrap();
+        assert_eq!(proxies[0].as_str(), Some("jp"));
+        assert_eq!(proxies[1].as_str(), Some("DIRECT"));
+
+        assert!(store
+            .upsert_proxy_group("BAD", "select", &["no-such".into()], None, None)
+            .is_err());
     }
 }

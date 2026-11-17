@@ -98,12 +98,27 @@ fn cli_kill(port: Option<u16>, pids: &[u32]) -> Result<(), String> {
     targets.dedup();
     for pid in targets {
         if is_our_mihomo(pid, &bin, &work) {
-            let _ = Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .status();
+            force_kill_pid(pid);
         }
     }
     Ok(())
+}
+
+/// 平台杀进程：Unix `kill -9`，Windows `taskkill /F`。
+/// Author: kejiqing
+pub fn force_kill_pid(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
 }
 
 fn trust_paths_from_exe() -> Result<(PathBuf, PathBuf), String> {
@@ -243,9 +258,7 @@ pub fn privileged_kill(work: &Path, port: u16, pids: &[u32]) {
 #[cfg(not(target_os = "macos"))]
 pub fn privileged_kill(_work: &Path, _port: u16, pids: &[u32]) {
     for pid in pids {
-        let _ = Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
+        force_kill_pid(*pid);
     }
 }
 
@@ -372,7 +385,7 @@ pub fn command_is_our_mihomo(cmd: &str, bin: &Path, work: &Path) -> bool {
         return false;
     }
     let bin_full = bin.to_string_lossy();
-    if !bin_full.is_empty() && cmd.contains(bin_full.as_ref()) {
+    if !bin_full.is_empty() && path_text_contains(cmd, bin_full.as_ref()) {
         return true;
     }
     let bin_name = bin
@@ -380,8 +393,23 @@ pub fn command_is_our_mihomo(cmd: &str, bin: &Path, work: &Path) -> bool {
         .and_then(|name| name.to_str())
         .unwrap_or("mihomo");
     let exe = cmd.split_whitespace().next().unwrap_or("");
-    let name_ok = exe == bin_name || exe.ends_with(&format!("/{bin_name}"));
-    name_ok && cmd.contains(work.to_string_lossy().as_ref())
+    let name_ok = exe.eq_ignore_ascii_case(bin_name)
+        || exe.ends_with(&format!("/{bin_name}"))
+        || exe.ends_with(&format!("\\{bin_name}"))
+        || exe.to_ascii_lowercase().ends_with(&format!("\\{}", bin_name.to_ascii_lowercase()));
+    name_ok && path_text_contains(cmd, work.to_string_lossy().as_ref())
+}
+
+fn path_text_contains(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    if haystack.contains(needle) {
+        return true;
+    }
+    let slash = needle.replace('\\', "/");
+    let back = needle.replace('/', "\\");
+    haystack.contains(&slash) || haystack.contains(&back)
 }
 
 pub fn is_our_mihomo(pid: u32, bin: &Path, work: &Path) -> bool {
@@ -389,8 +417,31 @@ pub fn is_our_mihomo(pid: u32, bin: &Path, work: &Path) -> bool {
 }
 
 pub fn process_command(pid: u32) -> String {
-    let output = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
+    #[cfg(windows)]
+    {
+        windows_process_command(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            }
+            _ => String::new(),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_command(pid: u32) -> String {
+    let script = format!(
+        "(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"
+    );
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
         .output();
     match output {
         Ok(output) if output.status.success() => {
@@ -401,7 +452,47 @@ pub fn process_command(pid: u32) -> String {
 }
 
 pub fn our_mihomo_pids(bin: &Path, work: &Path) -> Vec<u32> {
-    let Ok(output) = Command::new("ps").args(["-ax", "-o", "pid=,command="]).output() else {
+    #[cfg(windows)]
+    {
+        windows_our_mihomo_pids(bin, work)
+    }
+    #[cfg(not(windows))]
+    {
+        let Ok(output) = Command::new("ps").args(["-ax", "-o", "pid=,command="]).output() else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let (pid, cmd) = line.split_once(char::is_whitespace)?;
+                let pid = pid.trim().parse().ok()?;
+                if command_is_our_mihomo(cmd.trim(), bin, work) {
+                    Some(pid)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+#[cfg(windows)]
+fn windows_our_mihomo_pids(bin: &Path, work: &Path) -> Vec<u32> {
+    let bin_name = bin
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("mihomo.exe");
+    let script = format!(
+        "Get-CimInstance Win32_Process | Where-Object {{ $_.Name -ieq '{bin_name}' -or $_.Name -ieq 'mihomo.exe' }} | ForEach-Object {{ '{{0}} {{1}}' -f $_.ProcessId, $_.CommandLine }}"
+    );
+    let Ok(output) = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+    else {
         return Vec::new();
     };
     if !output.status.success() {
@@ -423,25 +514,72 @@ pub fn our_mihomo_pids(bin: &Path, work: &Path) -> Vec<u32> {
 }
 
 pub fn listener_pids(port: u16) -> Vec<u32> {
-    let mut lsof = if Path::new("/usr/sbin/lsof").is_file() {
-        Command::new("/usr/sbin/lsof")
-    } else {
-        Command::new("lsof")
-    };
-    let output = match lsof
-        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
-        .output()
+    #[cfg(windows)]
     {
-        Ok(output) => output,
-        Err(_) => return Vec::new(),
+        windows_listener_pids(port)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut lsof = if Path::new("/usr/sbin/lsof").is_file() {
+            Command::new("/usr/sbin/lsof")
+        } else {
+            Command::new("lsof")
+        };
+        let output = match lsof
+            .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => return Vec::new(),
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect()
+    }
+}
+
+#[cfg(windows)]
+fn windows_listener_pids(port: u16) -> Vec<u32> {
+    let Ok(output) = Command::new("netstat").args(["-ano"]).output() else {
+        return Vec::new();
     };
     if !output.status.success() {
         return Vec::new();
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().parse().ok())
-        .collect()
+    parse_windows_netstat_listeners(&String::from_utf8_lossy(&output.stdout), port)
+}
+
+/// 解析 `netstat -ano` 中 LISTENING 且本地端口匹配的 PID。Author: kejiqing
+pub(crate) fn parse_windows_netstat_listeners(text: &str, port: u16) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.contains("LISTENING") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        // TCP  local  foreign  LISTENING  pid
+        if parts.len() < 5 {
+            continue;
+        }
+        let local = parts[1];
+        let local_port = local
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.trim_end_matches(']').parse::<u16>().ok());
+        if local_port != Some(port) {
+            continue;
+        }
+        if let Ok(pid) = parts[parts.len() - 1].parse::<u32>() {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
 }
 
 #[cfg(test)]
@@ -463,6 +601,24 @@ mod tests {
         assert!(command_is_our_mihomo(&ours, bin, work));
         let verge = "/Library/Application Support/clash-verge-service/cores/verge-mihomo -d /Library/Application Support/clash-verge-service/users/501/runtime";
         assert!(!command_is_our_mihomo(verge, bin, work));
+    }
+
+    #[test]
+    fn our_mihomo_matches_windows_backslash_paths() {
+        let bin = Path::new(r"C:\Users\a\AppData\Roaming\top.passionke.supone-tunnel\bin\mihomo.exe");
+        let work = Path::new(r"C:\Users\a\AppData\Roaming\top.passionke.supone-tunnel");
+        let ours = r#"C:\Users\a\AppData\Roaming\top.passionke.supone-tunnel\bin\mihomo.exe -d C:\Users\a\AppData\Roaming\top.passionke.supone-tunnel -f C:\Users\a\AppData\Roaming\top.passionke.supone-tunnel\profiles\x\effective.yaml"#;
+        assert!(command_is_our_mihomo(ours, bin, work));
+    }
+
+    #[test]
+    fn parse_windows_netstat_matches_port() {
+        let text = "\
+  TCP    0.0.0.0:9090           0.0.0.0:0              LISTENING       4242
+  TCP    127.0.0.1:90901        0.0.0.0:0              LISTENING       99
+  TCP    [::]:9090              [::]:0                 LISTENING       4242
+";
+        assert_eq!(parse_windows_netstat_listeners(text, 9090), vec![4242]);
     }
 
     #[test]

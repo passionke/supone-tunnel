@@ -2,12 +2,13 @@
 
 Author: kejiqing
 
-NeuroGate（home：`http://10.8.0.21:18088`）挂本机 MCP：`streamable_http` / JSON-RPC HTTP + `Authorization: Bearer <token>`。
 壳内 Shell 是唯一写 mihomo / 系统代理的入口。本文件是工具契约。
 
-对话：应用「对话」页走 `POST /v1/chat/completions`，`AGENT_API_KEY=ngmk_…` 时固定传 `user`（本地 `conversation.json`），每轮只发当前 user 消息，网关侧 session 续聊；工具在项目 MCP，不在本机 7B 循环。
+**默认外部 agent**：PI 挂本机 MCP（`streamable_http` + Bearer）。NeuroGate 仍可 inject 同一套 `supone_*`。
 
-当前接入：`projId=99096`（`projectCode=supone-tunnel`）；inject URL 用本机 home 网可达地址（常见 `http://10.8.0.2:18765/mcp`）。
+应用「对话」页：`agentApiKey` 以 `ngmk_` 开头 → NeuroGate（工具在网关侧 MCP）；否则 → OpenAI 兼容 `chat/completions` 工具循环（如 DeepSeek SK + base URL，**不需要**本地 7B）。
+
+当前 NeuroGate 接入（可选）：`projId=99096`（`projectCode=supone-tunnel`）；inject URL 用本机可达地址（常见 `http://10.8.0.2:18765/mcp`）。
 
 ## 传输
 
@@ -16,9 +17,29 @@ NeuroGate（home：`http://10.8.0.21:18088`）挂本机 MCP：`streamable_http` 
 | URL | `http://<本机可达地址>:<port>/mcp` |
 | Auth | `Authorization: Bearer <mcpToken>` |
 | 方法 | `initialize` / `notifications/initialized` / `tools/list` / `tools/call` |
-| NeuroGate inject 形 | `{ enabled, type:"http", transport:"streamable_http", url, headers:{Authorization} }` |
+| 客户端 | PI / NeuroGate / 任意 streamable HTTP MCP 客户端 |
 
-设置（应用「设置」页）：`mcpEnabled`、`mcpBind`（默认 `0.0.0.0:18765`）、`mcpToken`（空则拒接）。
+设置（应用「设置」页）：`mcpEnabled`、`mcpBind`（默认 `0.0.0.0:18765`）、`mcpToken`（空则拒接）；对话另配 `agentBaseUrl` / `agentApiKey` / `agentModel`。
+
+### PI 接入
+
+契约与 NeuroGate 相同：streamable HTTP + Bearer。示例（用户级 `~/.pi/agent/mcp.json` 或项目 `.pi/mcp.json`）：
+
+```json
+{
+  "mcpServers": {
+    "supone-tunnel": {
+      "type": "http",
+      "url": "http://127.0.0.1:18765/mcp",
+      "headers": {
+        "Authorization": "Bearer <mcpToken>"
+      }
+    }
+  }
+}
+```
+
+也可用 `pi mcp add` 注册。PI Codemode（QuickJS）可组合 `supone_*`；本仓**不**在壳内嵌 OS sandbox——隔离放在 PI 进程侧（见文末「沙箱选型」）。
 
 ### NeuroGate inject 示例
 
@@ -38,9 +59,10 @@ NeuroGate（home：`http://10.8.0.21:18088`）挂本机 MCP：`streamable_http` 
 }
 ```
 
-agent duty 要点：出口问题先 `supone_explain_route`；**验证当前配置下某站点是否可达**用 `supone_probe_url`（经 mixed 实测；链路只信 `/connections` 连接日志的 rule/chains，禁止用规则表推理冒充）。TUN/多 VPN 先 `supone_net_overview`。看有哪些节点用 `supone_list_nodes`；要比快慢：单节点 `supone_test_delay`，比一圈 `supone_test_all_delays`，再 `supone_select_proxy`。
-规则和 DNS 用工具改，不要手写整份 YAML：
+agent duty 要点：出口问题先 `supone_explain_route`；**验证当前配置下某站点是否可达**用 `supone_probe_url`（经 mixed 实测；链路只信 `/connections` 连接日志的 rule/chains，禁止用规则表推理冒充）。TUN/多 VPN 先 `supone_net_overview`。看有哪些节点用 `supone_list_nodes`；要比延迟：单节点 `supone_test_delay`，比一圈 `supone_test_all_delays`；要吞吐用 `supone_test_bandwidth`；要抖动/失败率用 `supone_test_stability`；再 `supone_select_proxy`。用户要撤回 agent 改过的本地覆盖：`supone_reset_override`（或 UI「恢复初始」）。
+规则、DNS、代理组用工具改，不要手写整份 YAML：
 - 域名走哪组：`supone_prepend_rule`（`TYPE,匹配,策略`，插在订阅规则最前，刷新订阅不冲掉）
+- 新建/编辑代理组：`supone_upsert_proxy_group`（本地覆盖按名合并进 `proxy-groups`；成员来自 `list_nodes` / 已有组 / DIRECT|REJECT；刷新订阅不冲掉）
 - DNS：`supone_dns_config` 看现状，`supone_set_dns` 改 `enhanced-mode` / `nameserver` / `nameserver-policy` / `respect-rules`
 - TUN：`supone_set_tun` 与界面同一路径（提权 + 停再启）
 - 其它 VPN 叠网 / VPN 出口 IP 不进 TUN：`supone_add_tun_route_exclude`（写 `tun.route-exclude-address`，系统路由层；**不是** `IP-CIDR,…,DIRECT` 规则）
@@ -89,15 +111,18 @@ agent duty 要点：出口问题先 `supone_explain_route`；**验证当前配�
 | `supone_list_nodes` | — | 全部叶子节点名（不含组与内置策略） |
 | `supone_test_delay` | `name` | 测单个节点延迟（毫秒）。不切换节点，不是带宽 |
 | `supone_test_all_delays` | — | 测全部叶子节点延迟（毫秒）。不切换节点，不是带宽；节点多时较慢 |
+| `supone_test_bandwidth` | `timeout_ms?` | 经 mixed 测**当前出口吞吐**（Mbps）。限时截断下载；`REGION=china` 用国内源，否则 Cloudflare。不切换节点 |
+| `supone_test_stability` | `name?`, `samples?`, `interval_ms?` | 延迟采样统计（min/avg/max/jitter/失败率）。指定 `name` 测该节点；省略测当前出口。**不是带宽** |
 
 ## B. 订阅
 
-| 工具 | 参数 |
-|------|------|
-| `supone_list_profiles` | — |
-| `supone_import_subscription` | `url`, `name?` |
-| `supone_refresh_subscription` | `id` |
-| `supone_activate_profile` | `id` |
+| 工具 | 参数 | 说明 |
+|------|------|------|
+| `supone_list_profiles` | — | |
+| `supone_import_subscription` | `url`, `name?` | |
+| `supone_refresh_subscription` | `id` | 只换 remote，覆盖保留 |
+| `supone_activate_profile` | `id` | |
+| `supone_reset_override` | `id?` | 清空本地覆盖 → 仅订阅原文；不改 remote。省略 `id`=当前激活。UI「恢复初始」同路径 |
 
 ## C. 内核与出口
 
@@ -106,6 +131,7 @@ agent duty 要点：出口问题先 `supone_explain_route`；**验证当前配�
 | `supone_start_core` / `supone_stop_core` | — | 启停内核 |
 | `supone_set_mode` | `mode`: rule\|global\|direct | 代理模式 |
 | `supone_select_proxy` | `group`, `name` | 选节点 |
+| `supone_upsert_proxy_group` | `name`, `proxies`, `type?`, `url?`, `interval?` | 新建或按名编辑代理组（覆盖键 `proxy-group-upsert`，刷新订阅不冲掉；同名覆盖含订阅原文组） |
 | `supone_set_tun` | `enable` | 开关 TUN |
 | `supone_set_system_proxy` | `enable` | 系统代理指向 mixed 口；开时需内核已运行 |
 | `supone_set_allow_lan` | `enable` | 是否允许局域网访问 mixed 口 |
@@ -140,9 +166,22 @@ agent duty 要点：出口问题先 `supone_explain_route`；**验证当前配�
 6. **另有 VPN 抢走 default**：该 VPN 优先；此时再开 mihomo TUN 易冲突，先查 `supone_net_overview` / `supone_net_routes`。
 7. 诊断顺序：先 `supone_diagnose`（本机现场，含 DNS/端口/内核告警）→ 必要时 `supone_net_overview` / `interfaces` / `routes` → 业务域名用 `supone_explain_route` → 改配置后用 `supone_probe_url` 验证可达与真实链路。
 8. NeuroGate 跑在沙箱，**没有**本机网络视角；没调到 MCP 就不得编造本机状态。`probe_url` 的 chain 只能复述工具返回的连接日志，不能自行推出口节点。
+9. PI 在本机：仍只信 MCP 回报的状态；带宽看 `supone_test_bandwidth`，稳定性看 `supone_test_stability`，不要把延迟当吞吐。
+
+## 沙箱选型（调研结论，本期不嵌入壳）
+
+本仓 MCP 是特权面（改代理/规则），壳内再套 OS sandbox 挡不住要做的事。隔离放在 **PI 进程侧**。
+
+| 方案 | 跨平台 | 重量 | 适用性 |
+|------|--------|------|--------|
+| **PI Codemode（QuickJS）** | 随 PI | 极轻 | **首选**：组合 MCP 工具，无主机 FS/网络 |
+| sandbox-local / nanosandbox（Seatbelt / bwrap / Job Object） | 较好 | 轻 | 适合包住 PI/`bash`；**不**塞进 Shell |
+| Heimdall | 主 Linux/macOS | 轻 | 同 OS-native；Windows 弱 |
+| Wasm / Wassette | 强隔离 | 中 | 无法跑本机测网/代理工具，与 `supone_*` 不合 |
+| Docker / Firecracker / E2B | 重 / Linux | 重 | 正是要避开的远程沙箱复杂度 |
 
 ## 不上 MCP
 
 - shell / SSH。现场诊断用 `supone_diagnose` 等只读工具，不开放命令通道
-- 任意整份 YAML / override 整表替换（规则、DNS、TUN 排除走上面的结构化工具）
+- 任意整份 YAML / override 整表替换（规则、DNS、代理组、TUN 排除走结构化工具；**清空**覆盖用 `supone_reset_override`）
 - 读私钥文件

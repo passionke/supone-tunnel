@@ -116,6 +116,10 @@ fn asset_prefix() -> &'static str {
         "mihomo-darwin-arm64-"
     } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
         "mihomo-darwin-amd64-"
+    } else if cfg!(all(target_os = "android", target_arch = "x86_64")) {
+        "mihomo-android-amd64-"
+    } else if cfg!(all(target_os = "android", target_arch = "aarch64")) {
+        "mihomo-android-arm64-v8-"
     } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
         "mihomo-linux-arm64-"
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
