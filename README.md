@@ -55,9 +55,10 @@ Download from **[Releases](https://github.com/passionke/supone-tunnel/releases)*
 |----------|----------|
 | Windows x64 | `Supone.Tunnel_*_x64-setup.exe` (NSIS) |
 | macOS Apple Silicon | `Supone.Tunnel_*_macos-aarch64.app.zip` |
-| macOS Intel | `Supone.Tunnel_*_macos-x64.app.zip` |
 | Linux x64 (portable) | `*.AppImage` |
 | Linux x64 (Debian/Ubuntu) | `*.deb` |
+
+> Intel Mac：CI 不再打 x64（`macos-13` runner 常不可用）。本机 Intel 可用 `REGION=else ./scripts/build.sh`。
 
 macOS: unzip, drag `Supone Tunnel.app` to `/Applications`. Unsigned builds may need **Right-click → Open** the first time (or `xattr -dr com.apple.quarantine`).
 

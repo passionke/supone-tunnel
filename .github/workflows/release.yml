@@ -24,15 +24,11 @@ jobs:
             name: windows-x64
             bundles: nsis
             rust_target: x86_64-pc-windows-msvc
-          # macos-latest is Apple Silicon on current GHA; macos-13 is Intel.
+          # macos-latest = Apple Silicon on current GHA (Intel macos-13 often has no runners).
           - os: macos-latest
             name: macos-aarch64
             bundles: app
             rust_target: aarch64-apple-darwin
-          - os: macos-13
-            name: macos-x64
-            bundles: app
-            rust_target: x86_64-apple-darwin
           - os: ubuntu-22.04
             name: linux-x64
             bundles: appimage,deb
