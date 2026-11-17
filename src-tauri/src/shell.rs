@@ -72,7 +72,7 @@ impl Shell {
     pub fn settings_view(&self) -> SettingsView {
         let data = self.settings.get();
         SettingsView {
-            agent_ready: SettingsStore::agent_ready(&data),
+            agent_ready: self.agent_ready(),
             resolved_mihomo_bin: self
                 .runtime
                 .resolve_bin()
@@ -80,6 +80,9 @@ impl Shell {
                 .map(|path| path.display().to_string()),
             agent_base_url: data.agent_base_url,
             agent_api_key: data.agent_api_key,
+            agent_call_expires_at: data.agent_call_expires_at,
+            agent_subscription_token: data.agent_subscription_token,
+            agent_hub_user_id: data.agent_hub_user_id,
             agent_model: data.agent_model,
             mihomo_bin: data.mihomo_bin,
             mcp_enabled: data.mcp_enabled,
@@ -88,9 +91,24 @@ impl Shell {
         }
     }
 
-    pub fn save_settings(&self, next: AppSettings) -> Result<SettingsView, String> {
+    pub fn save_settings(&self, mut next: AppSettings) -> Result<SettingsView, String> {
+        // 对话凭证只由订阅换取写入；设置页保存不得覆盖。Author: kejiqing
+        let current = self.settings.get();
+        next.agent_base_url = current.agent_base_url;
+        next.agent_api_key = current.agent_api_key;
+        next.agent_call_expires_at = current.agent_call_expires_at;
+        next.agent_subscription_token = current.agent_subscription_token;
+        next.agent_hub_user_id = current.agent_hub_user_id;
         self.settings.save(next)?;
         Ok(self.settings_view())
+    }
+
+    /// 当前激活订阅是否为授权 phub clash URL。Author: kejiqing
+    pub fn agent_ready(&self) -> bool {
+        self.profiles
+            .active_url()
+            .and_then(|url| crate::call_token::parse_subscription_token(&url).ok())
+            .is_some()
     }
 
     pub async fn download_mihomo(&self) -> Result<SettingsView, String> {
@@ -103,15 +121,43 @@ impl Shell {
         Ok(self.settings_view())
     }
 
-    pub fn agent_settings(&self) -> Result<crate::agent::AgentSettings, String> {
+    /// 用当前订阅 token 换取 / 复用 NeuroGate 调用钥。Author: kejiqing
+    pub async fn agent_settings(&self) -> Result<crate::agent::AgentSettings, String> {
+        let url = self
+            .profiles
+            .active_url()
+            .ok_or_else(crate::call_token::missing_subscription_hint)?;
+        let sub_token = crate::call_token::parse_subscription_token(&url)?;
         let data = self.settings.get();
-        if !SettingsStore::agent_ready(&data) {
-            return Err("NeuroGate 未配置".into());
+        if data.agent_subscription_token == sub_token
+            && data.agent_api_key.starts_with("ngmk_")
+            && !data.agent_base_url.is_empty()
+            && data.agent_hub_user_id > 0
+            && crate::call_token::call_token_fresh(&data.agent_call_expires_at)
+        {
+            return Ok(crate::agent::AgentSettings {
+                base: data.agent_base_url,
+                key: data.agent_api_key,
+                model: data.agent_model,
+                hub_user_id: data.agent_hub_user_id,
+            });
         }
+        let issued = crate::call_token::exchange_call_token(&sub_token).await?;
+        if issued.user_id <= 0 {
+            return Err("Hub 未返回有效 user_id，请升级 Hub 后重试".into());
+        }
+        let saved = self.settings.save_call_credentials(
+            &sub_token,
+            &issued.base_url,
+            &issued.call_token,
+            &issued.expires_at,
+            issued.user_id,
+        )?;
         Ok(crate::agent::AgentSettings {
-            base: data.agent_base_url,
-            key: data.agent_api_key,
-            model: data.agent_model,
+            base: saved.agent_base_url,
+            key: saved.agent_api_key,
+            model: saved.agent_model,
+            hub_user_id: saved.agent_hub_user_id,
         })
     }
 
@@ -276,7 +322,6 @@ impl Shell {
             auto_route: tun.auto_route,
             system_proxy,
         });
-        let settings = self.settings.get();
         Ok(Status {
             running,
             version,
@@ -292,7 +337,7 @@ impl Shell {
                 .resolve_bin()
                 .ok()
                 .map(|path| path.display().to_string()),
-            agent_ready: SettingsStore::agent_ready(&settings),
+            agent_ready: self.agent_ready(),
             tun_enabled,
             tun_device,
             default_route,

@@ -110,6 +110,29 @@ main {
   min-width: 0;
 }
 
+/* MCP Token 等密文：输入 + 查看明文。Author: kejiqing */
+.settings-grid .secret-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+.settings-grid .secret-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-grid .secret-row button.ghost {
+  flex-shrink: 0;
+  padding: 6px 10px;
+  border: 1px solid #d0d7e2;
+  background: #fff;
+  color: #334155;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
 .url {
   word-break: break-all;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;

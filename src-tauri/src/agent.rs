@@ -462,10 +462,6 @@ fn load_meta(path: &Path) -> SessionMeta {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
-fn is_neurogate(settings: &AgentSettings) -> bool {
-    settings.key.starts_with("ngmk_")
-}
-
 pub async fn chat(
     shell: &Shell,
     session: &mut Session,
@@ -477,80 +473,15 @@ pub async fn chat(
         return Err("请输入内容".into());
     }
     ensure_not_cancelled(cancel)?;
-    let settings = shell.agent_settings()?;
+    // 对话凭证只走订阅 token → Hub 换取 ngmk_；无授权订阅直接返回。Author: kejiqing
+    let settings = shell.agent_settings().await?;
     session.records.push(Record::User {
         text: text.to_string(),
     });
     session.touch_title_from_user(text);
     session.save();
     session.save_meta();
-    if is_neurogate(&settings) {
-        return chat_neurogate(session, &settings, text, cancel).await;
-    }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|err| err.to_string())?;
-    for _ in 0..8 {
-        ensure_not_cancelled(cancel)?;
-        let messages = build_messages(shell, session).await?;
-        let response = post_chat(&client, &settings, messages, cancel).await?;
-        if let Some(calls) = response.tool_calls {
-            if !calls.is_empty() {
-                let mut stored = Vec::new();
-                for call in calls {
-                    ensure_not_cancelled(cancel)?;
-                    let raw = if call.function.arguments.trim().is_empty() {
-                        "{}".to_string()
-                    } else {
-                        call.function.arguments
-                    };
-                    let (args, result) = match session.redactor.restore_tool_args(&raw) {
-                        Ok(args) => {
-                            let result = dispatch(shell, &call.function.name, &args).await;
-                            (args, result)
-                        }
-                        Err(err) => (json!({}), format!("失败: {err}")),
-                    };
-                    stored.push(StoredCall {
-                        id: call.id,
-                        name: call.function.name,
-                        args,
-                        result,
-                    });
-                }
-                let preface = response.content.unwrap_or_default();
-                session.records.push(Record::Tools {
-                    preface: session.redactor.unmask(&preface),
-                    calls: stored,
-                });
-                session.updated_at = now_stamp();
-                session.save();
-                session.save_meta();
-                continue;
-            }
-        }
-        let reply = session
-            .redactor
-            .unmask(&response.content.unwrap_or_default());
-        let reply = if reply.trim().is_empty() {
-            "已执行。".to_string()
-        } else {
-            reply
-        };
-        session.records.push(Record::Assistant { text: reply });
-        session.updated_at = now_stamp();
-        session.save();
-        session.save_meta();
-        return Ok(session.ui_messages());
-    }
-    session.records.push(Record::Assistant {
-        text: "已达到 8 步上限".into(),
-    });
-    session.updated_at = now_stamp();
-    session.save();
-    session.save_meta();
-    Ok(session.ui_messages())
+    chat_neurogate(session, &settings, text, cancel).await
 }
 
 /// NeuroGate 多轮：固定 `user` 会话键；本轮只提交当前 user 消息；工具在网关侧 MCP。
@@ -567,7 +498,11 @@ async fn chat_neurogate(
         .map_err(|err| err.to_string())?;
     let body = json!({
         "model": settings.model,
-        "user": session.conversation_user(),
+        // phub-u{hubUserId}:{本机会话键} → 远端按人归因，本机多会话不串。Author: kejiqing
+        "user": crate::call_token::neurogate_user_key(
+            settings.hub_user_id,
+            session.conversation_user(),
+        ),
         "timeout": 300,
         "stream": false,
         "messages": [
@@ -806,6 +741,8 @@ pub struct AgentSettings {
     pub base: String,
     pub key: String,
     pub model: String,
+    /// Hub users.id；编进 NeuroGate `user`。Author: kejiqing
+    pub hub_user_id: i64,
 }
 
 fn completions_url(base: &str) -> String {
