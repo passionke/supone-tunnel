@@ -832,6 +832,24 @@ impl Shell {
         Ok(lines.join("\n"))
     }
 
+    /// 壳内对话当大模型调用时注入的只读本机上下文。Author: kejiqing
+    pub async fn chat_context_snapshot(&self) -> String {
+        let mut parts = Vec::new();
+        match self.list_text() {
+            Ok(text) => parts.push(format!("## 订阅\n{text}")),
+            Err(err) => parts.push(format!("## 订阅\n失败: {err}")),
+        }
+        match self.model_status().await {
+            Ok(text) => parts.push(format!("## 状态与代理组\n{text}")),
+            Err(err) => parts.push(format!("## 状态与代理组\n失败: {err}")),
+        }
+        match self.nodes_text().await {
+            Ok(text) => parts.push(format!("## 节点\n{text}")),
+            Err(err) => parts.push(format!("## 节点\n失败: {err}")),
+        }
+        parts.join("\n\n")
+    }
+
     pub async fn net_overview(&self) -> Result<String, String> {
         let system_proxy = sysproxy::is_enabled().ok();
         let tun = self.tun_view().await.unwrap_or_else(|_| crate::runtime::TunView::off());

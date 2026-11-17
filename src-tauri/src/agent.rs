@@ -481,12 +481,13 @@ pub async fn chat(
     session.touch_title_from_user(text);
     session.save();
     session.save_meta();
-    chat_neurogate(session, &settings, text, cancel).await
+    chat_neurogate(shell, session, &settings, text, cancel).await
 }
 
-/// NeuroGate 多轮：固定 `user` 会话键；本轮只提交当前 user 消息；工具在网关侧 MCP。
+/// NeuroGate 当大模型：壳注入本机只读快照 + 用户原文；不靠远端 MCP。
 /// Author: kejiqing
 async fn chat_neurogate(
+    shell: &Shell,
     session: &mut Session,
     settings: &AgentSettings,
     text: &str,
@@ -496,6 +497,12 @@ async fn chat_neurogate(
         .timeout(Duration::from_secs(330))
         .build()
         .map_err(|err| err.to_string())?;
+    ensure_not_cancelled(cancel)?;
+    let snapshot = shell.chat_context_snapshot().await;
+    // 远端没有本机工具：上下文必须由壳组好再调模型。Author: kejiqing
+    let prompt = format!(
+        "【本机只读快照】（由 Supone Tunnel 壳注入，回答本机状态/订阅/节点时必须以这份为准；不要说看不见或让用户去别处查已在快照里的信息）\n{snapshot}\n\n【用户】\n{text}"
+    );
     let body = json!({
         "model": settings.model,
         // phub-u{hubUserId}:{本机会话键} → 远端按人归因，本机多会话不串。Author: kejiqing
@@ -506,7 +513,7 @@ async fn chat_neurogate(
         "timeout": 300,
         "stream": false,
         "messages": [
-            {"role": "user", "content": text}
+            {"role": "user", "content": prompt}
         ]
     });
     let request = client
