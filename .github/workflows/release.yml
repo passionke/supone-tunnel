@@ -24,7 +24,8 @@ jobs:
             name: windows-x64
             bundles: nsis
             rust_target: x86_64-pc-windows-msvc
-          - os: macos-14
+          # macos-latest is Apple Silicon on current GHA; macos-13 is Intel.
+          - os: macos-latest
             name: macos-aarch64
             bundles: app
             rust_target: aarch64-apple-darwin
@@ -139,7 +140,8 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Publish whatever platforms succeeded (one matrix flake must not block the rest).
+    if: always() && startsWith(github.ref, 'refs/tags/v') && !cancelled()
     runs-on: ubuntu-22.04
     steps:
       - name: Download all artifacts
@@ -147,9 +149,12 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
+          pattern: supone-tunnel-*
 
       - name: List assets
-        run: find release-assets -type f -print
+        run: |
+          find release-assets -type f -print
+          test -n "$(find release-assets -type f | head -1)"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
