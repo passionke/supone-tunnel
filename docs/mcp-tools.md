@@ -4,11 +4,11 @@ Author: kejiqing
 
 壳内 Shell 是唯一写 mihomo / 系统代理的入口。本文件是工具契约。
 
-**默认外部 agent**：PI 挂本机 MCP（`streamable_http` + Bearer）。NeuroGate 仍可 inject 同一套 `supone_*`。
+**默认外部 agent**：PI 等客户端挂本机 MCP（`streamable_http` + Bearer）。
 
-应用「对话」页：`agentApiKey` 以 `ngmk_` 开头 → NeuroGate（工具在网关侧 MCP）；否则 → OpenAI 兼容 `chat/completions` 工具循环（如 DeepSeek SK + base URL，**不需要**本地 7B）。
+应用「对话」页走**本机工具环**：Hub 订阅换 `phllm_` → OpenAI 兼容口（tools）→ 本地 `dispatch`。凭证由订阅换取，设置页不手填 raw key。
 
-当前 NeuroGate 接入（可选）：`projId=99096`（`projectCode=supone-tunnel`）；inject URL 用本机可达地址（常见 `http://10.8.0.2:18765/mcp`）。
+MCP 仍可被任意 streamable HTTP 客户端 inject 同一套 `supone_*`（inject URL 用本机可达地址，常见 `http://127.0.0.1:18765/mcp`）。
 
 ## 传输
 
