@@ -145,7 +145,8 @@ docs/mcp-tools.md   MCP + tool contract
 
 ## License
 
-[MIT](LICENSE) © kejiqing
+[Apache License 2.0](LICENSE) © kejiqing  
+See also [`NOTICE`](NOTICE).
 
 ---
 
@@ -158,4 +159,4 @@ docs/mcp-tools.md   MCP + tool contract
 - MCP 契约：[`docs/mcp-tools.md`](docs/mcp-tools.md)
 - 构建镜像开关：环境变量 `REGION=china` 或 `else`（唯一分叉）
 
-作者：kejiqing · 协议：MIT
+作者：kejiqing · 协议：Apache-2.0
