@@ -259,6 +259,12 @@ impl ProfileStore {
         self.lock().state.active_id.clone()
     }
 
+    /// 当前激活订阅的导入 URL（对话鉴权取订阅 token 用）。Author: kejiqing
+    pub fn active_url(&self) -> Option<String> {
+        let id = self.active_id()?;
+        self.meta_of(&id).ok().map(|meta| meta.url)
+    }
+
     pub fn read_override(&self) -> Result<String, String> {
         let id = self.require_active()?;
         let guard = self.lock();

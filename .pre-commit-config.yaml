@@ -1,0 +1,8 @@
+# author: kejiqing
+# 本地提交前扫密钥；CI 同样用 .gitleaks.toml。
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.28.0
+    hooks:
+      - id: gitleaks
+        name: gitleaks (Hub subscription / secrets)

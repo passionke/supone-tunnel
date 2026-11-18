@@ -143,7 +143,7 @@ function StatusPane() {
         <span>官方内核</span>
         <span className="url">{status?.mihomoBin || "未安装，请到设置下载"}</span>
         <span>对话</span>
-        <span>{status?.agentReady ? "已配置" : "未配置"}</span>
+        <span>{status?.agentReady ? "已授权" : "需订阅 token"}</span>
       </div>
       <div className="actions">
         <button
@@ -240,7 +240,7 @@ function ProfilePane() {
         <input
           type="url"
           required
-          placeholder="订阅地址 https://"
+          placeholder="https://phub.supone.vip/clash/<token>"
           value={url}
           onInput={(event) => setUrl(event.currentTarget.value)}
         />
@@ -518,7 +518,10 @@ function ChatPane() {
       </div>
       <div className="chat" ref={thread} key={activeId}>
         {messages.length === 0 && !sending && (
-          <p className="chat-empty">直接说要改的出口、规则或 DNS。设置里可配 DeepSeek SK 或 NeuroGate。</p>
+          <p className="chat-empty">
+            壳内对话走本机工具环（Hub phllm_ → llm.bitkindle.com）。需先在「订阅」导入
+            https://phub.supone.vip/clash/…
+          </p>
         )}
         {messages.map((item, index) => (
           <ChatMessage item={item} key={`${activeId}-${item.role}-${index}`} />
@@ -624,7 +627,10 @@ function SettingsPane() {
   const [form, setForm] = useState<AppSettings>({
     agentBaseUrl: "",
     agentApiKey: "",
-    agentModel: "",
+    agentCallExpiresAt: "",
+    agentSubscriptionToken: "",
+    agentHubUserId: 0,
+    agentModel: "agent",
     mihomoBin: "",
     mcpEnabled: false,
     mcpBind: "0.0.0.0:18765",
@@ -634,12 +640,16 @@ function SettingsPane() {
   const [error, setError] = useState("");
   const [hint, setHint] = useState("");
   const [busy, setBusy] = useState(false);
+  const [mcpTokenVisible, setMcpTokenVisible] = useState(false);
 
   function apply(view: SettingsView) {
     setForm({
       agentBaseUrl: view.agentBaseUrl,
       agentApiKey: view.agentApiKey,
-      agentModel: view.agentModel,
+      agentCallExpiresAt: view.agentCallExpiresAt,
+      agentSubscriptionToken: view.agentSubscriptionToken,
+      agentHubUserId: view.agentHubUserId || 0,
+      agentModel: view.agentModel || "agent",
       mihomoBin: view.mihomoBin,
       mcpEnabled: view.mcpEnabled,
       mcpBind: view.mcpBind || "0.0.0.0:18765",
@@ -671,25 +681,9 @@ function SettingsPane() {
   return (
     <section className="panel">
       <p className="muted">
-        对话：key 以 ngmk_ 开头走 NeuroGate；否则走 OpenAI 兼容 API（如 DeepSeek）。外部 agent（PI）挂本机 MCP。
+        壳内对话走本机工具环：订阅换 phllm_ → supone-llm（DeepSeek）→ 本地改节点/规则。
       </p>
       <div className="grid settings-grid">
-        <label htmlFor="agent-base">对话 Base URL</label>
-        <input
-          id="agent-base"
-          type="text"
-          placeholder="https://api.deepseek.com 或 NeuroGate 地址"
-          value={form.agentBaseUrl}
-          onInput={(event) => setForm({ ...form, agentBaseUrl: event.currentTarget.value })}
-        />
-        <label htmlFor="agent-key">对话 API Key</label>
-        <input
-          id="agent-key"
-          type="password"
-          placeholder="sk-… 或 ngmk_…"
-          value={form.agentApiKey}
-          onInput={(event) => setForm({ ...form, agentApiKey: event.currentTarget.value })}
-        />
         <label htmlFor="agent-model">对话模型</label>
         <input
           id="agent-model"
@@ -714,7 +708,7 @@ function SettingsPane() {
             checked={form.mcpEnabled}
             onChange={(event) => setForm({ ...form, mcpEnabled: event.currentTarget.checked })}
           />
-          启用 HTTP + Token（给 PI / NeuroGate 挂载）
+          启用 HTTP + Token（给 NeuroGate 挂载）
         </label>
         <label htmlFor="mcp-bind">MCP 监听</label>
         <input
@@ -725,13 +719,22 @@ function SettingsPane() {
           onInput={(event) => setForm({ ...form, mcpBind: event.currentTarget.value })}
         />
         <label htmlFor="mcp-token">MCP Token</label>
-        <input
-          id="mcp-token"
-          type="password"
-          placeholder="Bearer token"
-          value={form.mcpToken}
-          onInput={(event) => setForm({ ...form, mcpToken: event.currentTarget.value })}
-        />
+        <div className="secret-row">
+          <input
+            id="mcp-token"
+            type={mcpTokenVisible ? "text" : "password"}
+            placeholder="Bearer token"
+            value={form.mcpToken}
+            onInput={(event) => setForm({ ...form, mcpToken: event.currentTarget.value })}
+          />
+          <button
+            type="button"
+            className="ghost"
+            onClick={() => setMcpTokenVisible((v) => !v)}
+          >
+            {mcpTokenVisible ? "隐藏" : "查看明文"}
+          </button>
+        </div>
       </div>
       <div className="actions">
         <button

@@ -21,6 +21,9 @@ export type Status = {
 export type AppSettings = {
   agentBaseUrl: string;
   agentApiKey: string;
+  agentCallExpiresAt: string;
+  agentSubscriptionToken: string;
+  agentHubUserId: number;
   agentModel: string;
   mihomoBin: string;
   mcpEnabled: boolean;
