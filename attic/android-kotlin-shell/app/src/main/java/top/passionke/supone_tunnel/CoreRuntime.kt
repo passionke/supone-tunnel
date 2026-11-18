@@ -183,7 +183,7 @@ class CoreRuntime(private val context: Context) {
     companion object {
         private const val PREFS = "supone"
         private const val KEY_SUB_URL = "subscription_url"
-        const val DEFAULT_SUB =
-            "https://phub.supone.vip/clash/ss754CVMoG_D4TGV60jZzidYsfyqhEBA"
+        // No hardcoded Hub token — set via prefs / UI. Author: kejiqing
+        const val DEFAULT_SUB = ""
     }
 }

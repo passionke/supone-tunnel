@@ -131,15 +131,15 @@ mod tests {
     #[test]
     fn parses_phub_clash_url() {
         let token = parse_subscription_token(
-            "https://phub.supone.vip/clash/_MDQIXgJRaG2iJZisNHaJVwvpmNc5RI_",
+            "https://phub.supone.vip/clash/example_token",
         )
         .unwrap();
-        assert_eq!(token, "_MDQIXgJRaG2iJZisNHaJVwvpmNc5RI_");
+        assert_eq!(token, "example_token");
         let with_slash = parse_subscription_token(
-            "https://phub.supone.vip/clash/_MDQIXgJRaG2iJZisNHaJVwvpmNc5RI_/",
+            "https://phub.supone.vip/clash/example_token/",
         )
         .unwrap();
-        assert_eq!(with_slash, "_MDQIXgJRaG2iJZisNHaJVwvpmNc5RI_");
+        assert_eq!(with_slash, "example_token");
     }
 
     #[test]
@@ -147,7 +147,7 @@ mod tests {
         assert!(parse_subscription_token("https://example.com/clash/abc").is_err());
         assert!(parse_subscription_token("https://phub.supone.vip/clash/").is_err());
         assert!(parse_subscription_token("https://phub.supone.vip/clash/a/b").is_err());
-        assert!(parse_subscription_token("_MDQIXgJRaG2iJZisNHaJVwvpmNc5RI_").is_err());
+        assert!(parse_subscription_token("example_token").is_err());
     }
 
     #[test]

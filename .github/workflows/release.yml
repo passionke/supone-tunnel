@@ -1,13 +1,9 @@
 # author: kejiqing
-# Windows / macOS / Linux 打包；v* tag 挂到 GitHub Release。
+# 仅正式 tag（v*）打包并挂到 GitHub Release；日常改动走 PR 合并 main，不触发本流程。
 name: release
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
-      - ui/profile-active-cst
     tags:
       - "v*"
 

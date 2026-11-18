@@ -49,7 +49,7 @@ flowchart LR
 
 ## Install
 
-Download from **[Releases](https://github.com/passionke/supone-tunnel/releases)** (CI builds on every `v*` tag):
+Download from **[Releases](https://github.com/passionke/supone-tunnel/releases)** (CI packages only on formal `v*` tags):
 
 | Platform | Artifact |
 |----------|----------|
@@ -58,7 +58,7 @@ Download from **[Releases](https://github.com/passionke/supone-tunnel/releases)*
 | Linux x64 (portable) | `*.AppImage` |
 | Linux x64 (Debian/Ubuntu) | `*.deb` |
 
-> Intel Mac：CI 不再打 x64（`macos-13` runner 常不可用）。本机 Intel 可用 `REGION=else ./scripts/build.sh`。
+> Intel Mac：CI 不打 x64。本机 Intel 用 `REGION=else ./scripts/build.sh`。
 
 macOS: unzip, drag `Supone Tunnel.app` to `/Applications`. Unsigned builds may need **Right-click → Open** the first time (or `xattr -dr com.apple.quarantine`).
 
@@ -135,13 +135,14 @@ ui/                 React (Vite) frontend
 src-tauri/          Rust / Tauri 2 shell, mihomo control, agent, MCP
 scripts/            build / dev helpers
 docs/mcp-tools.md   MCP + tool contract
-.github/workflows/  Windows NSIS + GitHub Release on v* tags
+.github/workflows/  GitHub Release package only on v* tags
 ```
 
 ## Versioning & releases
 
+- Day-to-day: PR → merge `main` (no package / no Release)
 - Semver in `package.json` / `src-tauri/tauri.conf.json` / `src-tauri/Cargo.toml`
-- Tag `vX.Y.Z` → CI matrix builds **Windows + macOS (arm64/x64) + Linux (AppImage/deb)** → attaches all artifacts to the [GitHub Release](https://github.com/passionke/supone-tunnel/releases)
+- Formal release: on `main`, tag `vX.Y.Z` → CI builds **Windows + macOS arm64 + Linux (AppImage/deb)** → [GitHub Release](https://github.com/passionke/supone-tunnel/releases)
 
 Local macOS only:
 
@@ -152,8 +153,10 @@ REGION=else ./scripts/build.sh   # → /Applications/Supone Tunnel.app
 ## Contributing
 
 - Prefer small PRs that stay inside module boundaries (`Shell` owns mihomo writes; UI/agent/MCP call into it)
+- Land changes by merging to `main`; do not push ad-hoc branches to trigger packaging
 - Do not add a second “just for this case” config or deploy path without discussion
 - New source files: set file-header `Author: kejiqing` (not git commit identity)
+- No real Hub subscription URLs/tokens in tree; `gitleaks` (`.gitleaks.toml`) via pre-commit + CI on `main`/PR
 
 ## License
 
@@ -166,7 +169,7 @@ See also [`NOTICE`](NOTICE).
 
 **Supone Tunnel** 是本机 **mihomo 壳**：订阅、TUN / 系统代理，以及能**真正改本机代理**的对话工具环（不是只读嘴炮）。同一套能力也对外部 agent 暴露为 **MCP**。
 
-- 安装：见 [Releases](https://github.com/passionke/supone-tunnel/releases)（Windows / macOS arm64+x64 / Linux AppImage+deb；本机 mac 也可用 `REGION=china|else ./scripts/build.sh`）
+- 安装：见 [Releases](https://github.com/passionke/supone-tunnel/releases)（仅 `v*` tag 打包：Windows / macOS arm64 / Linux AppImage+deb；日常合并 `main`；本机 mac 可用 `REGION=china|else ./scripts/build.sh`）
 - 对话：导入 `https://phub.supone.vip/clash/<token>` → Hub 换 `phllm_` → OpenAI 兼容口带 tools → **本机执行**
 - MCP 契约：[`docs/mcp-tools.md`](docs/mcp-tools.md)
 - 构建镜像开关：环境变量 `REGION=china` 或 `else`（唯一分叉）

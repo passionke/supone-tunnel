@@ -1,0 +1,35 @@
+# author: kejiqing
+# Hub 订阅 URL/token 不得进仓；占位符见 rule allowlist。
+title = "supone-tunnel"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "build / lock artifacts"
+paths = [
+  '''(^|/)target/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)dist/''',
+  '''(^|/)ui/dist/''',
+  '''package-lock\.json$''',
+  '''Cargo\.lock$''',
+]
+
+[[rules]]
+id = "phub-clash-subscription-url"
+description = "phub.supone.vip Hub subscription URL with a real token path"
+regex = '''(?i)https?://phub\.supone\.vip/clash/([A-Za-z0-9_-]{8,})'''
+secretGroup = 1
+keywords = ["phub.supone.vip", "/clash/"]
+
+  [[rules.allowlists]]
+  description = "docs / tests placeholders only"
+  regexTarget = "secret"
+  regexes = [
+    '''(?i)^example_token$''',
+    '''(?i)^example$''',
+    '''(?i)^test_token$''',
+    '''(?i)^your_token_here$''',
+    '''^<token>$''',
+  ]
