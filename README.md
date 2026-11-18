@@ -153,7 +153,7 @@ REGION=else ./scripts/build.sh   # → /Applications/Supone Tunnel.app
 
 - Prefer small PRs that stay inside module boundaries (`Shell` owns mihomo writes; UI/agent/MCP call into it)
 - Do not add a second “just for this case” config or deploy path without discussion
-- Author credit in new source: `kejiqing`
+- New source files: set file-header `Author: kejiqing` (not git commit identity)
 
 ## License
 
